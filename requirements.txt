@@ -1,0 +1,15 @@
+# DeepSeek-V3 operator screenshot tool dependencies
+#
+# torch: TorchDispatchMode + meta-tensor forward pass
+torch>=2.0.0
+
+# transformers: model config/modeling utilities
+# Pin below 5.0 because modeling_deepseek.py uses internal APIs removed in 5.x:
+#   - transformers.modeling_attn_mask_utils._prepare_4d_attention_mask
+#   - transformers.modeling_attn_mask_utils._prepare_4d_causal_attention_mask
+#   - transformers.pytorch_utils.is_torch_greater_or_equal_than_1_13
+#   - transformers.pytorch_utils.ALL_LAYERNORM_LAYERS
+transformers>=4.36.0,<5.0.0
+
+# openpyxl: write formatted Excel workbook
+openpyxl>=3.1.0

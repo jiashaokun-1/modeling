@@ -1,6 +1,7 @@
 """Entry point: load model, trace forward, write Excel + JSON."""
 from __future__ import annotations
 
+import argparse
 import logging
 from pathlib import Path
 
@@ -13,19 +14,35 @@ from screenshot_ops.tracker import ModuleTracker
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-MODEL_DIR = Path(__file__).parent.parent / "hf_models" / "deepseek_v3"
-OUTPUT_FILE = Path(__file__).parent.parent / "deepseek_v3_ops.xlsx"
+MODEL_DIRS = {
+    "v3": "deepseek_v3",
+    "v3.2": "deepseek_v3_2",
+}
 
 logger = logging.getLogger(__name__)
 
 
 def main():
-    num_layers = 4
-    batch_size = 1
-    seq_len = 128
+    parser = argparse.ArgumentParser(description="Trace LLM operator sequences")
+    parser.add_argument("--model", choices=MODEL_DIRS.keys(), default="v3",
+                        help="Model version to trace (default: v3)")
+    parser.add_argument("--layers", type=int, default=4,
+                        help="Number of layers to trace (default: 4)")
+    parser.add_argument("--seq-len", type=int, default=128,
+                        help="Sequence length (default: 128)")
+    args = parser.parse_args()
 
-    logger.info("Loading DeepSeek-V3 model from %s (%d layers)...", MODEL_DIR, num_layers)
-    model, config = load_model(MODEL_DIR, num_hidden_layers=num_layers)
+    model_name = args.model
+    num_layers = args.layers
+    batch_size = 1
+    seq_len = args.seq_len
+
+    model_dir_name = MODEL_DIRS[model_name]
+    model_dir = Path(__file__).parent.parent / "hf_models" / model_dir_name
+    output_file = Path(__file__).parent.parent / f"deepseek_{model_name.replace('.', '_')}_ops.xlsx"
+
+    logger.info("Loading DeepSeek-%s model from %s (%d layers)...", model_name.upper(), model_dir, num_layers)
+    model, config = load_model(model_dir, num_hidden_layers=num_layers)
 
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), device="meta")
     position_ids = torch.arange(seq_len, device="meta").unsqueeze(0)
@@ -50,8 +67,9 @@ def main():
 
     logger.info("Captured %d ops (after filtering zero-cost reshapes)", len(recorder.records))
 
+    model_type = getattr(config, "model_type", f"deepseek_{model_name.replace('.', '_')}")
     config_summary = {
-        "model_type": "deepseek_v3",
+        "model_type": model_type,
         "hidden_size": config.hidden_size,
         "intermediate_size": config.intermediate_size,
         "moe_intermediate_size": config.moe_intermediate_size,
@@ -72,6 +90,16 @@ def main():
         "batch_size": batch_size,
         "seq_len": seq_len,
     }
+    
+    if hasattr(config, "index_head_dim"):
+        config_summary["index_head_dim"] = config.index_head_dim
+        config_summary["index_n_heads"] = config.index_n_heads
+        config_summary["index_topk"] = config.index_topk
 
     writer = ExcelWriter(tracker)
-    writer.write(recorder.records, OUTPUT_FILE, config_summary)
+    writer.write(recorder.records, output_file, config_summary)
+    logger.info("Output saved to %s", output_file)
+
+
+if __name__ == "__main__":
+    main()

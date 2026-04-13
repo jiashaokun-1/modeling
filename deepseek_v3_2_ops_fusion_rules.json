@@ -1,0 +1,159 @@
+[
+  {
+    "module_class": "DeepseekV32RMSNorm",
+    "aten_op_sequence": [
+      "aten.pow.Tensor_Scalar",
+      "aten.mean.dim",
+      "aten.add.Tensor",
+      "aten.rsqrt.default",
+      "aten.mul.Tensor"
+    ],
+    "num_sub_ops": 6,
+    "fusion_level": "leaf",
+    "example_module_path": "model.layers.0.input_layernorm",
+    "occurrences": 21,
+    "fused_input_shapes": "[1, 128, 7168], [7168]",
+    "fused_input_dtypes": "torch.float32, torch.float32",
+    "fused_input_sources": "aten.pow.Tensor_Scalar (in[0]) | aten.mul.Tensor (in[0])",
+    "fused_output_shapes": "[1, 128, 7168]",
+    "fused_output_dtypes": "torch.float32",
+    "fused_output_sources": "aten.mul.Tensor (out[0])"
+  },
+  {
+    "module_class": "DeepseekV32MLP",
+    "aten_op_sequence": [
+      "aten.mm.default",
+      "aten.silu.default",
+      "aten.mul.Tensor"
+    ],
+    "num_sub_ops": 5,
+    "fusion_level": "parent",
+    "example_module_path": "model.layers.0.mlp",
+    "occurrences": 5,
+    "fused_input_shapes": "[7168, 18432], [1, 128, 18432]",
+    "fused_input_dtypes": "torch.float32, torch.float32",
+    "fused_input_sources": "aten.mm.default (in[1]) | aten.mul.Tensor (in[1])",
+    "fused_output_shapes": "[128, 18432], [128, 7168]",
+    "fused_output_dtypes": "torch.float32, torch.float32",
+    "fused_output_sources": "aten.mm.default (out[0]) | aten.mm.default (out[0])"
+  },
+  {
+    "module_class": "DeepseekV32Indexer",
+    "aten_op_sequence": [
+      "aten.mm.default",
+      "aten.native_layer_norm.default",
+      "aten.transpose.int",
+      "aten.bmm.default",
+      "aten.add.Tensor",
+      "aten._softmax.default",
+      "aten.topk.default"
+    ],
+    "num_sub_ops": 10,
+    "fusion_level": "parent",
+    "example_module_path": "model.layers.0.self_attn.indexer",
+    "occurrences": 4,
+    "fused_input_shapes": "[128, 1536], [1536, 8192], [128, 7168], [1, 128, 128], [128], [128], [128, 7168], [64, 64, 128], [1, 1, 128, 128]",
+    "fused_input_dtypes": "torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32",
+    "fused_input_sources": "aten.mm.default (in[0]) | aten.mm.default (in[1]) | aten.mm.default (in[0]) | aten.native_layer_norm.default (in[0]) | aten.native_layer_norm.default (in[1]) | aten.native_layer_norm.default (in[2]) | aten.mm.default (in[0]) | aten.bmm.default (in[1]) | aten.add.Tensor (in[1])",
+    "fused_output_shapes": "[128, 128], [1, 128, 128], [1, 64, 64, 128], [1, 64, 128, 128]",
+    "fused_output_dtypes": "torch.float32, torch.float32, torch.float32, torch.int64",
+    "fused_output_sources": "aten.mm.default (out[0]) | aten.native_layer_norm.default (out[0]) | aten.transpose.int (out[0]) | aten.topk.default (out[1])"
+  },
+  {
+    "module_class": "DeepseekV32YarnRotaryEmbedding",
+    "aten_op_sequence": [
+      "aten.arange.start_step",
+      "aten.div.Tensor",
+      "aten.pow.Scalar",
+      "aten.reciprocal.default",
+      "aten.mul.Tensor",
+      "aten.sub.Tensor",
+      "aten.clamp.default",
+      "aten._to_copy.default",
+      "aten.rsub.Scalar",
+      "aten.add.Tensor",
+      "aten.cat.default",
+      "aten.cos.default",
+      "aten.sin.default"
+    ],
+    "num_sub_ops": 26,
+    "fusion_level": "leaf",
+    "example_module_path": "model.layers.0.self_attn.rotary_emb",
+    "occurrences": 4,
+    "fused_input_shapes": "[128, 1]",
+    "fused_input_dtypes": "torch.float32",
+    "fused_input_sources": "aten.mul.Tensor (in[0])",
+    "fused_output_shapes": "[128, 64], [128, 64]",
+    "fused_output_dtypes": "torch.float32, torch.float32",
+    "fused_output_sources": "aten.mul.Tensor (out[0]) | aten.mul.Tensor (out[0])"
+  },
+  {
+    "module_class": "DeepseekV32Attention",
+    "aten_op_sequence": [
+      "aten.index.Tensor",
+      "aten.transpose.int",
+      "aten.mul.Tensor",
+      "aten.neg.default",
+      "aten.cat.default",
+      "aten.add.Tensor",
+      "aten.new_empty.default",
+      "aten.copy_.default",
+      "aten.bmm.default",
+      "aten._softmax.default"
+    ],
+    "num_sub_ops": 27,
+    "fusion_level": "leaf",
+    "example_module_path": "model.layers.0.self_attn",
+    "occurrences": 4,
+    "fused_input_shapes": "[128, 64], [1, 128], [128, 64], [1, 128, 128, 64], [1, 1, 128, 64], [1, 128, 128, 32], [1, 128, 128, 32], [1, 1, 128, 64], [1, 1, 128, 32], [1, 1, 128, 32], [1, 128, 128, 128], [1, 128, 128, 128], [1, 128, 128, 64], [1, 128, 128, 128], [1, 1, 128, 128], [128, 128, 128], [1, 128, 128, 128]",
+    "fused_input_dtypes": "torch.float32, torch.int64, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32, torch.float32",
+    "fused_input_sources": "aten.index.Tensor (in[0]) | aten.index.Tensor (in[1]) | aten.index.Tensor (in[0]) | aten.mul.Tensor (in[0]) | aten.mul.Tensor (in[1]) | aten.neg.default (in[0]) | aten.cat.default (in[1]) | aten.mul.Tensor (in[1]) | aten.neg.default (in[0]) | aten.cat.default (in[1]) | aten.copy_.default (in[1]) | aten.copy_.default (in[1]) | aten.copy_.default (in[1]) | aten.mul.Tensor (in[0]) | aten.add.Tensor (in[1]) | aten.bmm.default (in[1]) | aten.transpose.int (in[0])",
+    "fused_output_shapes": "[1, 128, 64], [1, 128, 64], [1, 128, 128, 192], [128, 128, 128], [128, 128, 128]",
+    "fused_output_dtypes": "torch.float32, torch.float32, torch.float32, torch.float32, torch.float32",
+    "fused_output_sources": "aten.index.Tensor (out[0]) | aten.index.Tensor (out[0]) | aten.new_empty.default (out[0]) | aten.bmm.default (out[0]) | aten.bmm.default (out[0])"
+  },
+  {
+    "module_class": "DeepseekV32Model",
+    "aten_op_sequence": [
+      "aten.embedding.default",
+      "aten.rsub.Scalar",
+      "aten._to_copy.default",
+      "aten.masked_fill.Scalar"
+    ],
+    "num_sub_ops": 4,
+    "fusion_level": "parent",
+    "example_module_path": "model",
+    "occurrences": 1,
+    "fused_input_shapes": "[129280, 7168], [1, 128], [1, 1, 128, 128]",
+    "fused_input_dtypes": "torch.float32, torch.int64, torch.float32",
+    "fused_input_sources": "aten.embedding.default (in[0]) | aten.embedding.default (in[1]) | aten.rsub.Scalar (in[0])",
+    "fused_output_shapes": "[1, 128, 7168], [1, 1, 128, 128]",
+    "fused_output_dtypes": "torch.float32, torch.float32",
+    "fused_output_sources": "aten.embedding.default (out[0]) | aten.masked_fill.Scalar (out[0])"
+  },
+  {
+    "module_class": "MoEGate",
+    "aten_op_sequence": [
+      "aten.mm.default",
+      "aten.sigmoid.default",
+      "aten.add.Tensor",
+      "aten.topk.default",
+      "aten.sum.dim_IntList",
+      "aten._to_copy.default",
+      "aten.masked_fill.Scalar",
+      "aten.gather.default",
+      "aten.div.Tensor",
+      "aten.mul.Tensor"
+    ],
+    "num_sub_ops": 14,
+    "fusion_level": "leaf",
+    "example_module_path": "model.layers.3.mlp.gate",
+    "occurrences": 1,
+    "fused_input_shapes": "[128, 7168]",
+    "fused_input_dtypes": "torch.float32",
+    "fused_input_sources": "aten.mm.default (in[0])",
+    "fused_output_shapes": "[128, 4], [128, 256], [128, 8]",
+    "fused_output_dtypes": "torch.int64, torch.bool, torch.float32",
+    "fused_output_sources": "aten.topk.default (out[1]) | aten._to_copy.default (out[0]) | aten.mul.Tensor (out[0])"
+  }
+]

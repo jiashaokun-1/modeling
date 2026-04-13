@@ -74,7 +74,7 @@ if is_torch_fx_available():
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "DeepseekV3Config"
+_CONFIG_FOR_DOC = "DeepseekV32Config"
 
 
 def _get_unpad_data(attention_mask):
@@ -91,10 +91,10 @@ def _get_unpad_data(attention_mask):
     )
 
 
-class DeepseekV3RMSNorm(nn.Module):
+class DeepseekV32RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        DeepseekV3RMSNorm is equivalent to T5LayerNorm
+        DeepseekV32RMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -108,10 +108,60 @@ class DeepseekV3RMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
+ALL_LAYERNORM_LAYERS.append(DeepseekV32RMSNorm)
 
 
-class DeepseekV3RotaryEmbedding(nn.Module):
+class DeepseekV32Indexer(nn.Module):
+    """V3.2 specific Indexer module for efficient context retrieval.
+    
+    Simplified for meta-device tracing - captures operator structure
+    without actual FP8 quantization or custom kernel calls.
+    """
+    
+    def __init__(self, config: DeepseekV32Config):
+        super().__init__()
+        self.index_n_heads = config.index_n_heads
+        self.index_head_dim = config.index_head_dim
+        self.index_topk = config.index_topk
+        self.q_lora_rank = config.q_lora_rank
+        self.rope_head_dim = config.qk_rope_head_dim
+        
+        self.wq_b = nn.Linear(self.q_lora_rank, self.index_n_heads * self.index_head_dim, bias=False)
+        self.wk = nn.Linear(config.hidden_size, self.index_head_dim, bias=False)
+        self.k_norm = nn.LayerNorm(self.index_head_dim)
+        self.weights_proj = nn.Linear(config.hidden_size, self.index_n_heads, bias=False)
+    
+    def forward(self, x: torch.Tensor, qr: torch.Tensor, 
+                position_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None):
+        """Simplified forward for meta-device tracing."""
+        bsz, seqlen, _ = x.size()
+        
+        q = self.wq_b(qr)
+        q = q.view(bsz, seqlen, self.index_n_heads, self.index_head_dim)
+        q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.index_head_dim - self.rope_head_dim], dim=-1)
+        
+        k = self.wk(x)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.index_head_dim - self.rope_head_dim], dim=-1)
+        
+        weights = self.weights_proj(x)
+        
+        # Simulate attention score computation
+        q_nope = q_nope.transpose(1, 2)
+        k_nope = k_nope.transpose(1, 2).transpose(2, 3)
+        scores = torch.matmul(q_nope, k_nope)
+        
+        if attention_mask is not None:
+            scores = scores + attention_mask
+        
+        scores = nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
+        
+        topk_indices = scores.topk(min(self.index_topk, seqlen), dim=-1)[1]
+        return topk_indices
+
+
+class DeepseekV32RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
 
@@ -154,9 +204,9 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         )
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->DeepseekV3
-class DeepseekV3LinearScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
-    """DeepseekV3RotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
+# Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->DeepseekV32
+class DeepseekV32LinearScalingRotaryEmbedding(DeepseekV32RotaryEmbedding):
+    """DeepseekV32RotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
     def __init__(
         self,
@@ -183,9 +233,9 @@ class DeepseekV3LinearScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->DeepseekV3
-class DeepseekV3DynamicNTKScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
-    """DeepseekV3RotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
+# Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->DeepseekV32
+class DeepseekV32DynamicNTKScalingRotaryEmbedding(DeepseekV32RotaryEmbedding):
+    """DeepseekV32RotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
 
     def __init__(
         self,
@@ -259,7 +309,7 @@ def yarn_linear_ramp_mask(min, max, dim):
     return ramp_func
 
 
-class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
+class DeepseekV32YarnRotaryEmbedding(DeepseekV32RotaryEmbedding):
 
     def __init__(
         self,
@@ -371,7 +421,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class DeepseekV3MLP(nn.Module):
+class DeepseekV32MLP(nn.Module):
     def __init__(self, config, hidden_size=None, intermediate_size=None):
         super().__init__()
         self.config = config
@@ -472,7 +522,7 @@ class MoEGate(nn.Module):
 
         return topk_idx, topk_weight
 
-class DeepseekV3MoE(nn.Module):
+class DeepseekV32MoE(nn.Module):
     """
     A mixed expert module containing shared experts.
     """
@@ -490,7 +540,7 @@ class DeepseekV3MoE(nn.Module):
             self.experts = nn.ModuleList(
                 [
                     (
-                        DeepseekV3MLP(
+                        DeepseekV32MLP(
                             config, intermediate_size=config.moe_intermediate_size
                         )
                         if i >= self.ep_rank * self.experts_per_rank
@@ -506,7 +556,7 @@ class DeepseekV3MoE(nn.Module):
             self.ep_rank = 0
             self.experts = nn.ModuleList(
                 [
-                    DeepseekV3MLP(
+                    DeepseekV32MLP(
                         config, intermediate_size=config.moe_intermediate_size
                     )
                     for i in range(config.n_routed_experts)
@@ -515,7 +565,7 @@ class DeepseekV3MoE(nn.Module):
         self.gate = MoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV3MLP(
+            self.shared_experts = DeepseekV32MLP(
                 config=config, intermediate_size=intermediate_size
             )
 
@@ -623,11 +673,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaAttention with Llama->DeepseekV3
-class DeepseekV3Attention(nn.Module):
+# Copied from transformers.models.llama.modeling_llama.LlamaAttention with Llama->DeepseekV32
+class DeepseekV32Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: DeepseekV3Config, layer_idx: Optional[int] = None):
+    def __init__(self, config: DeepseekV32Config, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -661,7 +711,7 @@ class DeepseekV3Attention(nn.Module):
             self.q_a_proj = nn.Linear(
                 self.hidden_size, config.q_lora_rank, bias=config.attention_bias
             )
-            self.q_a_layernorm = DeepseekV3RMSNorm(config.q_lora_rank)
+            self.q_a_layernorm = DeepseekV32RMSNorm(config.q_lora_rank)
             self.q_b_proj = nn.Linear(
                 config.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )
@@ -671,7 +721,7 @@ class DeepseekV3Attention(nn.Module):
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = DeepseekV3RMSNorm(config.kv_lora_rank)
+        self.kv_a_layernorm = DeepseekV32RMSNorm(config.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
             self.num_heads
@@ -684,6 +734,10 @@ class DeepseekV3Attention(nn.Module):
             self.hidden_size,
             bias=config.attention_bias,
         )
+        
+        # V3.2 specific: Indexer module for efficient context retrieval
+        self.indexer = DeepseekV32Indexer(config)
+        
         self._init_rope()
 
         self.softmax_scale = self.q_head_dim ** (-0.5)
@@ -696,7 +750,7 @@ class DeepseekV3Attention(nn.Module):
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
-            self.rotary_emb = DeepseekV3RotaryEmbedding(
+            self.rotary_emb = DeepseekV32RotaryEmbedding(
                 self.qk_rope_head_dim,
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
@@ -705,14 +759,14 @@ class DeepseekV3Attention(nn.Module):
             scaling_type = self.config.rope_scaling["type"]
             scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
-                self.rotary_emb = DeepseekV3LinearScalingRotaryEmbedding(
+                self.rotary_emb = DeepseekV32LinearScalingRotaryEmbedding(
                     self.qk_rope_head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                     base=self.rope_theta,
                 )
             elif scaling_type == "dynamic":
-                self.rotary_emb = DeepseekV3DynamicNTKScalingRotaryEmbedding(
+                self.rotary_emb = DeepseekV32DynamicNTKScalingRotaryEmbedding(
                     self.qk_rope_head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
@@ -730,7 +784,7 @@ class DeepseekV3Attention(nn.Module):
                     ]
                     if key in self.config.rope_scaling
                 }
-                self.rotary_emb = DeepseekV3YarnRotaryEmbedding(
+                self.rotary_emb = DeepseekV32YarnRotaryEmbedding(
                     self.qk_rope_head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
@@ -786,6 +840,12 @@ class DeepseekV3Attention(nn.Module):
         k_nope, value_states = torch.split(
             kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
+        
+        # V3.2: Run indexer for context retrieval
+        if self.q_lora_rank is not None:
+            qr = self.q_a_layernorm(self.q_a_proj(hidden_states))
+            topk_indices = self.indexer(hidden_states, qr, position_ids, attention_mask)
+        
         kv_seq_len = value_states.shape[-2]
         if past_key_value is not None:
             if self.layer_idx is None:
@@ -856,10 +916,10 @@ class DeepseekV3Attention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2 with Llama->DeepseekV3
-class DeepseekV3FlashAttention2(DeepseekV3Attention):
+# Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2 with Llama->DeepseekV32
+class DeepseekV32FlashAttention2(DeepseekV32Attention):
     """
-    DeepseekV3 flash attention module. This module inherits from `DeepseekV3Attention` as the weights of the module stays
+    DeepseekV32 flash attention module. This module inherits from `DeepseekV32Attention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
     flash attention and deal with padding tokens in case the input contains any of them.
     """
@@ -882,7 +942,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         use_cache: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # DeepseekV3FlashAttention2 attention does not support output_attentions
+        # DeepseekV32FlashAttention2 attention does not support output_attentions
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
@@ -959,7 +1019,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         # therefore the input hidden states gets silently casted in float32. Hence, we need
         # cast them back in the correct dtype just to be sure everything works as expected.
         # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32. (DeepseekV3RMSNorm handles it correctly)
+        # in fp32. (DeepseekV32RMSNorm handles it correctly)
 
         input_dtype = query_states.dtype
         if input_dtype == torch.float32:
@@ -1039,7 +1099,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         if not self._flash_attn_uses_top_left_mask:
             causal = self.is_causal
         else:
-            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in DeepseekV3FlashAttention2 __init__.
+            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in DeepseekV32FlashAttention2 __init__.
             causal = self.is_causal and query_length != 1
 
         # Contains at least one padding token in the sequence
@@ -1134,13 +1194,13 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
 
 
 ATTENTION_CLASSES = {
-    "eager": DeepseekV3Attention,
-    "flash_attention_2": DeepseekV3FlashAttention2,
+    "eager": DeepseekV32Attention,
+    "flash_attention_2": DeepseekV32FlashAttention2,
 }
 
 
-class DeepseekV3DecoderLayer(nn.Module):
-    def __init__(self, config: DeepseekV3Config, layer_idx: int):
+class DeepseekV32DecoderLayer(nn.Module):
+    def __init__(self, config: DeepseekV32Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -1149,18 +1209,18 @@ class DeepseekV3DecoderLayer(nn.Module):
         )
 
         self.mlp = (
-            DeepseekV3MoE(config)
+            DeepseekV32MoE(config)
             if (
                 config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0
             )
-            else DeepseekV3MLP(config)
+            else DeepseekV32MLP(config)
         )
-        self.input_layernorm = DeepseekV3RMSNorm(
+        self.input_layernorm = DeepseekV32RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = DeepseekV3RMSNorm(
+        self.post_attention_layernorm = DeepseekV32RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -1227,7 +1287,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         return outputs
 
 
-DeepseekV3_START_DOCSTRING = r"""
+DeepseekV32_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
@@ -1237,7 +1297,7 @@ DeepseekV3_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`DeepseekV3Config`]):
+        config ([`DeepseekV32Config`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -1245,14 +1305,14 @@ DeepseekV3_START_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare DeepseekV3 Model outputting raw hidden-states without any specific head on top.",
-    DeepseekV3_START_DOCSTRING,
+    "The bare DeepseekV32 Model outputting raw hidden-states without any specific head on top.",
+    DeepseekV32_START_DOCSTRING,
 )
-class DeepseekV3PreTrainedModel(PreTrainedModel):
-    config_class = DeepseekV3Config
+class DeepseekV32PreTrainedModel(PreTrainedModel):
+    config_class = DeepseekV32Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["DeepseekV3DecoderLayer"]
+    _no_split_modules = ["DeepseekV32DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_cache_class = True
@@ -1269,7 +1329,7 @@ class DeepseekV3PreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-DeepseekV3_INPUTS_DOCSTRING = r"""
+DeepseekV32_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
@@ -1340,18 +1400,18 @@ DeepseekV3_INPUTS_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare DeepseekV3 Model outputting raw hidden-states without any specific head on top.",
-    DeepseekV3_START_DOCSTRING,
+    "The bare DeepseekV32 Model outputting raw hidden-states without any specific head on top.",
+    DeepseekV32_START_DOCSTRING,
 )
-class DeepseekV3Model(DeepseekV3PreTrainedModel):
+class DeepseekV32Model(DeepseekV32PreTrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`DeepseekV3DecoderLayer`]
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`DeepseekV32DecoderLayer`]
 
     Args:
-        config: DeepseekV3Config
+        config: DeepseekV32Config
     """
 
-    def __init__(self, config: DeepseekV3Config):
+    def __init__(self, config: DeepseekV32Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1361,12 +1421,12 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                DeepseekV3DecoderLayer(config, layer_idx)
+                DeepseekV32DecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1378,7 +1438,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(DeepseekV3_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(DeepseekV32_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1511,12 +1571,12 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         )
 
 
-class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
+class DeepseekV32ForCausalLM(DeepseekV32PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = DeepseekV3Model(config)
+        self.model = DeepseekV32Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1541,7 +1601,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    @add_start_docstrings_to_model_forward(DeepseekV3_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(DeepseekV32_INPUTS_DOCSTRING)
     @replace_return_docstrings(
         output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC
     )
@@ -1570,9 +1630,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, DeepseekV3ForCausalLM
+        >>> from transformers import AutoTokenizer, DeepseekV32ForCausalLM
 
-        >>> model = DeepseekV3ForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
+        >>> model = DeepseekV32ForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
         >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
@@ -1718,9 +1778,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
 @add_start_docstrings(
     """
-    The DeepseekV3 Model transformer with a sequence classification head on top (linear layer).
+    The DeepseekV32 Model transformer with a sequence classification head on top (linear layer).
 
-    [`DeepseekV3ForSequenceClassification`] uses the last token in order to do the classification, as other causal models
+    [`DeepseekV32ForSequenceClassification`] uses the last token in order to do the classification, as other causal models
     (e.g. GPT-2) do.
 
     Since it does classification on the last token, it requires to know the position of the last token. If a
@@ -1729,13 +1789,13 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
     each row of the batch).
     """,
-    DeepseekV3_START_DOCSTRING,
+    DeepseekV32_START_DOCSTRING,
 )
-class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
+class DeepseekV32ForSequenceClassification(DeepseekV32PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = DeepseekV3Model(config)
+        self.model = DeepseekV32Model(config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
@@ -1747,7 +1807,7 @@ class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(DeepseekV3_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(DeepseekV32_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,

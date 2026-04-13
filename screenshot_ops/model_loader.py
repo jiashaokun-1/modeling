@@ -1,4 +1,4 @@
-"""Load DeepSeek-V3 model onto meta device with compatibility patches."""
+"""Load DeepSeek models onto meta device with compatibility patches."""
 from __future__ import annotations
 
 import importlib
@@ -12,10 +12,40 @@ import torch.nn as nn
 
 
 def load_model(model_dir: Path, num_hidden_layers: int = 2) -> Tuple[nn.Module, Any]:
-    """Load DeepSeek-V3 from local config onto meta device."""
+    """Load DeepSeek model from local config onto meta device."""
     _patch_transformers_compat()
 
     config_mod, modeling_mod = _import_model_package(model_dir)
+    
+    config_path = model_dir / "config.json"
+    raw = json.loads(config_path.read_text())
+    model_type = raw.get("model_type", "deepseek_v3")
+    
+    if model_type == "deepseek_v32":
+        return _load_v32(config_mod, modeling_mod, model_dir, num_hidden_layers)
+    else:
+        return _load_v3(config_mod, modeling_mod, model_dir, num_hidden_layers)
+
+
+def _load_v32(config_mod, modeling_mod, model_dir: Path, num_hidden_layers: int):
+    """Load DeepSeek-V3.2 model."""
+    DeepseekV32Config = config_mod.DeepseekV32Config
+    DeepseekV32ForCausalLM = modeling_mod.DeepseekV32ForCausalLM
+
+    config = _build_config(DeepseekV32Config, model_dir, num_hidden_layers)
+
+    with torch.device("meta"):
+        model = DeepseekV32ForCausalLM(config)
+    model.eval()
+
+    _patch_moe_forward(modeling_mod.DeepseekV32MoE)
+    _patch_indexer_forward(modeling_mod.DeepseekV32Indexer)
+
+    return model, config
+
+
+def _load_v3(config_mod, modeling_mod, model_dir: Path, num_hidden_layers: int):
+    """Load DeepSeek-V3 model."""
     DeepseekV3Config = config_mod.DeepseekV3Config
     DeepseekV3ForCausalLM = modeling_mod.DeepseekV3ForCausalLM
 
@@ -59,7 +89,7 @@ def _import_model_package(model_dir: Path):
     return config_mod, modeling_mod
 
 
-def _build_config(DeepseekV3Config, model_dir: Path, num_hidden_layers: int):
+def _build_config(ConfigClass, model_dir: Path, num_hidden_layers: int):
     config_path = model_dir / "config.json"
     raw = json.loads(config_path.read_text())
     raw["num_hidden_layers"] = num_hidden_layers
@@ -72,8 +102,8 @@ def _build_config(DeepseekV3Config, model_dir: Path, num_hidden_layers: int):
 
     original_rope_scaling = raw.get("rope_scaling")
 
-    default_keys = DeepseekV3Config().__dict__
-    config = DeepseekV3Config(**{
+    default_keys = ConfigClass().__dict__
+    config = ConfigClass(**{
         k: v for k, v in raw.items()
         if k in default_keys or k.startswith("_")
     })
@@ -85,7 +115,7 @@ def _build_config(DeepseekV3Config, model_dir: Path, num_hidden_layers: int):
     return config
 
 
-def _patch_moe_forward(DeepseekV3MoE):
+def _patch_moe_forward(MoEClass):
     def _moe_forward_meta(self, hidden_states):
         identity = hidden_states
         orig_shape = hidden_states.shape
@@ -103,4 +133,37 @@ def _patch_moe_forward(DeepseekV3MoE):
             y = y + self.shared_experts(identity)
         return y
 
-    DeepseekV3MoE.forward = _moe_forward_meta
+    MoEClass.forward = _moe_forward_meta
+
+
+def _patch_indexer_forward(IndexerClass):
+    """Patch Indexer to work on meta device (simplified forward)."""
+    def _indexer_forward_meta(self, x, qr, position_ids=None, attention_mask=None):
+        bsz, seqlen, _ = x.size()
+        
+        q = self.wq_b(qr)
+        q = q.view(bsz, seqlen, self.index_n_heads, self.index_head_dim)
+        q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.index_head_dim - self.rope_head_dim], dim=-1)
+        
+        k = self.wk(x)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.index_head_dim - self.rope_head_dim], dim=-1)
+        
+        weights = self.weights_proj(x)
+        
+        # q_nope: [bsz, seqlen, n_heads, head_dim] -> [bsz, n_heads, seqlen, head_dim]
+        q_nope = q_nope.transpose(1, 2)
+        # k_nope: [bsz, seqlen, head_dim] -> [bsz, 1, seqlen, head_dim] -> broadcast to heads
+        k_nope = k_nope.unsqueeze(1).expand(-1, self.index_n_heads, -1, -1)
+        
+        scores = torch.matmul(q_nope, k_nope.transpose(2, 3))
+        
+        if attention_mask is not None:
+            scores = scores + attention_mask
+        
+        scores = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
+        
+        topk_indices = scores.topk(min(self.index_topk, seqlen), dim=-1)[1]
+        return topk_indices
+
+    IndexerClass.forward = _indexer_forward_meta

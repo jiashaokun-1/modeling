@@ -7,5 +7,4 @@ pass on meta tensors, then dump the ordered sequence to Excel.
 """
 from screenshot_ops.main import main
 
-if __name__ == "__main__":
-    main()
+__all__ = ["main"]

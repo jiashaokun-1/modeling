@@ -15,30 +15,11 @@
     "example_module_path": "model.layers.0.input_layernorm",
     "input_map": [
       {
+        "name": "hidden_states",
+        "kind": "input",
         "sub_op": "aten.pow.Tensor_Scalar",
         "sub_op_seq_idx": 0,
         "arg_slot": 0,
-        "shape": "[1, 128, 7168]",
-        "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.add.Tensor",
-        "sub_op_seq_idx": 2,
-        "arg_slot": 0,
-        "shape": "[1, 128, 1]",
-        "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.mul.Tensor",
-        "sub_op_seq_idx": 5,
-        "arg_slot": 0,
-        "shape": "[7168]",
-        "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.mul.Tensor",
-        "sub_op_seq_idx": 5,
-        "arg_slot": 1,
         "shape": "[1, 128, 7168]",
         "dtype": "torch.float32"
       }
@@ -49,6 +30,17 @@
         "sub_op_seq_idx": 5,
         "out_slot": 0,
         "shape": "[1, 128, 7168]",
+        "dtype": "torch.float32"
+      }
+    ],
+    "parameter_map": [
+      {
+        "name": "weight",
+        "kind": "parameter",
+        "sub_op": "aten.mul.Tensor",
+        "sub_op_seq_idx": 5,
+        "arg_slot": 0,
+        "shape": "[7168]",
         "dtype": "torch.float32"
       }
     ]
@@ -69,6 +61,8 @@
     "example_module_path": "model.layers.0.self_attn.indexer",
     "input_map": [
       {
+        "name": "x",
+        "kind": "input",
         "sub_op": "aten.add.Tensor",
         "sub_op_seq_idx": 2,
         "arg_slot": 0,
@@ -76,6 +70,8 @@
         "dtype": "torch.float32"
       },
       {
+        "name": "x",
+        "kind": "input",
         "sub_op": "aten.add.Tensor",
         "sub_op_seq_idx": 2,
         "arg_slot": 1,
@@ -124,31 +120,21 @@
     "example_module_path": "model.layers.0.self_attn.rotary_emb",
     "input_map": [
       {
-        "sub_op": "aten.reciprocal.default",
-        "sub_op_seq_idx": 3,
+        "name": "x",
+        "kind": "input",
+        "sub_op": "aten.div.Tensor",
+        "sub_op_seq_idx": 1,
         "arg_slot": 0,
         "shape": "[32]",
         "dtype": "torch.float32"
       },
       {
+        "name": "x",
+        "kind": "input",
         "sub_op": "aten.mul.Tensor",
-        "sub_op_seq_idx": 17,
+        "sub_op_seq_idx": 20,
         "arg_slot": 0,
-        "shape": "[32]",
-        "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.cat.default",
-        "sub_op_seq_idx": 21,
-        "arg_slot": 0,
-        "shape": "[128, 32]",
-        "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.mul.Tensor",
-        "sub_op_seq_idx": 23,
-        "arg_slot": 0,
-        "shape": "[128, 64]",
+        "shape": "[128, 1]",
         "dtype": "torch.float32"
       }
     ],
@@ -156,6 +142,13 @@
       {
         "sub_op": "aten.mul.Tensor",
         "sub_op_seq_idx": 23,
+        "out_slot": 0,
+        "shape": "[128, 64]",
+        "dtype": "torch.float32"
+      },
+      {
+        "sub_op": "aten.mul.Tensor",
+        "sub_op_seq_idx": 25,
         "out_slot": 0,
         "shape": "[128, 64]",
         "dtype": "torch.float32"
@@ -183,6 +176,8 @@
     "example_module_path": "model.layers.0.self_attn",
     "input_map": [
       {
+        "name": "attention_mask",
+        "kind": "input",
         "sub_op": "aten.index.Tensor",
         "sub_op_seq_idx": 0,
         "arg_slot": 0,
@@ -190,6 +185,8 @@
         "dtype": "torch.float32"
       },
       {
+        "name": "attention_mask",
+        "kind": "input",
         "sub_op": "aten.index.Tensor",
         "sub_op_seq_idx": 0,
         "arg_slot": 1,
@@ -197,13 +194,17 @@
         "dtype": "torch.int64"
       },
       {
-        "sub_op": "aten.index.Tensor",
-        "sub_op_seq_idx": 1,
+        "name": "attention_mask",
+        "kind": "input",
+        "sub_op": "aten.mul.Tensor",
+        "sub_op_seq_idx": 9,
         "arg_slot": 0,
-        "shape": "[128, 64]",
+        "shape": "[1, 1, 128, 64]",
         "dtype": "torch.float32"
       },
       {
+        "name": "attention_mask",
+        "kind": "input",
         "sub_op": "aten.copy_.default",
         "sub_op_seq_idx": 15,
         "arg_slot": 1,
@@ -211,20 +212,8 @@
         "dtype": "torch.float32"
       },
       {
-        "sub_op": "aten.copy_.default",
-        "sub_op_seq_idx": 18,
-        "arg_slot": 1,
-        "shape": "[1, 128, 128, 128]",
-        "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.add.Tensor",
-        "sub_op_seq_idx": 23,
-        "arg_slot": 0,
-        "shape": "[1, 128, 128, 128]",
-        "dtype": "torch.float32"
-      },
-      {
+        "name": "attention_mask",
+        "kind": "input",
         "sub_op": "aten.add.Tensor",
         "sub_op_seq_idx": 23,
         "arg_slot": 1,
@@ -232,29 +221,16 @@
         "dtype": "torch.float32"
       },
       {
+        "name": "attention_mask",
+        "kind": "input",
         "sub_op": "aten.bmm.default",
         "sub_op_seq_idx": 25,
         "arg_slot": 0,
         "shape": "[128, 128, 128]",
         "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.transpose.int",
-        "sub_op_seq_idx": 26,
-        "arg_slot": 0,
-        "shape": "[1, 128, 128, 128]",
-        "dtype": "torch.float32"
       }
     ],
-    "output_map": [
-      {
-        "sub_op": "aten.index.Tensor",
-        "sub_op_seq_idx": 0,
-        "out_slot": 0,
-        "shape": "[1, 128, 64]",
-        "dtype": "torch.float32"
-      }
-    ]
+    "output_map": []
   },
   {
     "rule_name": "DeepseekV32Model",
@@ -270,15 +246,10 @@
     "example_module_path": "model",
     "input_map": [
       {
+        "name": "inputs_embeds",
+        "kind": "input",
         "sub_op": "aten.rsub.Scalar",
         "sub_op_seq_idx": 0,
-        "arg_slot": 0,
-        "shape": "[1, 1, 128, 128]",
-        "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten._to_copy.default",
-        "sub_op_seq_idx": 1,
         "arg_slot": 0,
         "shape": "[1, 1, 128, 128]",
         "dtype": "torch.float32"
@@ -315,42 +286,16 @@
     "example_module_path": "model.layers.3.mlp.gate",
     "input_map": [
       {
+        "name": "hidden_states",
+        "kind": "input",
         "sub_op": "aten.mm.default",
         "sub_op_seq_idx": 0,
         "arg_slot": 0,
         "shape": "[128, 7168]",
         "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.sigmoid.default",
-        "sub_op_seq_idx": 1,
-        "arg_slot": 0,
-        "shape": "[128, 256]",
-        "dtype": "torch.float32"
-      },
-      {
-        "sub_op": "aten.masked_fill.Scalar",
-        "sub_op_seq_idx": 7,
-        "arg_slot": 1,
-        "shape": "[128, 256]",
-        "dtype": "torch.bool"
-      },
-      {
-        "sub_op": "aten.add.Tensor",
-        "sub_op_seq_idx": 11,
-        "arg_slot": 0,
-        "shape": "[128, 1]",
-        "dtype": "torch.float32"
       }
     ],
     "output_map": [
-      {
-        "sub_op": "aten._to_copy.default",
-        "sub_op_seq_idx": 6,
-        "out_slot": 0,
-        "shape": "[128, 256]",
-        "dtype": "torch.bool"
-      },
       {
         "sub_op": "aten.mul.Tensor",
         "sub_op_seq_idx": 13,

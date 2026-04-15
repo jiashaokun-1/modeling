@@ -1,9 +1,10 @@
 """Two-pass automatic operator fusion using module hierarchy."""
 from __future__ import annotations
 
+import inspect
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from screenshot_ops.tracker import ModuleTracker
 
@@ -25,9 +26,10 @@ class FusionSpec:
     fused_output_shapes: str = ""
     fused_output_dtypes: str = ""
     fused_output_sources: str = ""
-    # Structured I/O maps — exported to JSON for programmatic use
     input_map: List[Dict] = field(default_factory=list)
     output_map: List[Dict] = field(default_factory=list)
+    parameter_map: List[Dict] = field(default_factory=list)
+    constant_map: List[Dict] = field(default_factory=list)
 
 
 def _split_shape_list(s: str) -> List[str]:
@@ -79,47 +81,62 @@ def _aten_short(op_name: str) -> str:
 
 
 def _compute_fused_io(ops: List[Dict[str, Any]],
-                      graph=None) -> Dict[str, Any]:
+                      graph=None,
+                      module_tracker: Optional[ModuleTracker] = None) -> Dict[str, Any]:
     """Identify external inputs/outputs of a fused group.
+
+    Classifies each external input as one of:
+      - **input**: a tensor coming from outside the module (e.g. hidden_states)
+      - **parameter**: a module weight/bias (nn.Parameter)
+      - **constant**: a scalar literal (e.g. epsilon)
 
     Parameters
     ----------
     ops:
         Raw op records belonging to this fused group.
     graph:
-        ``DataFlowGraph`` used to resolve tensor IDs through skip ops
-        (view/reshape).  When provided, a tensor consumed inside the group
-        that was produced by a *skip op* wrapping an *internal* tensor is
-        correctly classified as internal rather than external.
-
-    Returns
-    -------
-    Dict with keys:
-        fused_input_shapes, fused_input_dtypes, fused_input_sources,
-        fused_output_shapes, fused_output_dtypes, fused_output_sources,
-        _input_map  (List[Dict] — structured, for FusionSpec/JSON),
-        _output_map (List[Dict] — structured, for FusionSpec/JSON),
+        ``DataFlowGraph`` used to resolve tensor IDs through skip ops.
+    module_tracker:
+        ``ModuleTracker`` with ``path_to_module`` mapping, used to
+        inspect the module's ``forward()`` signature and
+        ``named_parameters()`` for input/parameter classification.
     """
     group_indices = {op["idx"] for op in ops}
 
+    module_path = ops[0].get("module_path", "")
+    module_class = ops[0].get("module_class", "")
+
+    forward_param_names: Set[str] = set()
+    module_param_shapes: Dict[str, str] = {}
+    module_param_dtypes: Dict[str, str] = {}
+
+    if module_tracker and module_path in module_tracker.path_to_module:
+        mod = module_tracker.path_to_module[module_path]
+        try:
+            sig = inspect.signature(mod.forward)
+            forward_param_names = {
+                n for n in sig.parameters if n != "self"
+            }
+        except (ValueError, TypeError):
+            pass
+        for name, param in mod.named_parameters():
+            module_param_shapes[name] = str(list(param.shape))
+            module_param_dtypes[name] = str(param.dtype)
+
     def _is_internal(tid: int) -> bool:
-        """True if tensor *tid* was produced by an op in this group,
-        following passthrough chains through skip ops."""
         if graph is None:
-            # Fallback: no graph, use raw set membership
             all_produced = {t for op in ops for t in op.get("_output_ids", [])}
             return tid in all_produced
         return graph.is_produced_by_any(tid, group_indices)
 
     def _all_internal_resolved() -> set:
-        """Canonical IDs of all tensors consumed internally (after resolution)."""
         if graph is None:
             return {t for op in ops for t in op.get("_input_ids", [])}
         return {graph.resolve_id(t) for op in ops for t in op.get("_input_ids", [])}
 
     # ── External inputs ────────────────────────────────────────────────────
     seen_canonical_in: set = set()
-    ext_inputs: List[Tuple[int, Dict, int]] = []  # (tensor_id, op, slot)
+    ext_inputs: List[Tuple[int, Dict, int]] = []
 
     for op in ops:
         for slot, tid in enumerate(op.get("_input_ids", [])):
@@ -133,21 +150,25 @@ def _compute_fused_io(ops: List[Dict[str, Any]],
     # ── External outputs ───────────────────────────────────────────────────
     internal_consumed_resolved = _all_internal_resolved()
     seen_canonical_out: set = set()
-    ext_outputs: List[Tuple[int, Dict, int]] = []  # (tensor_id, op, slot)
+    ext_outputs: List[Tuple[int, Dict, int]] = []
 
     for op in reversed(ops):
         for slot, tid in enumerate(op.get("_output_ids", [])):
             canonical = graph.resolve_id(tid) if graph else tid
             if canonical in seen_canonical_out:
                 continue
-            # External output = produced here but NOT consumed by any internal op
             if canonical not in internal_consumed_resolved:
                 seen_canonical_out.add(canonical)
                 ext_outputs.insert(0, (tid, op, slot))
 
-    # ── Build shape / dtype / source strings ──────────────────────────────
+    # ── Classify external inputs ───────────────────────────────────────────
     input_shapes, input_dtypes, input_sources = [], [], []
     input_map: List[Dict] = []
+    parameter_map: List[Dict] = []
+    constant_map: List[Dict] = []
+
+    max_inputs = len(forward_param_names) if forward_param_names else float("inf")
+    seen_input_shapes: set = set()
 
     for sub_idx, (tid, op, slot) in enumerate(ext_inputs):
         shapes = _split_shape_list(op["input_shapes"])
@@ -155,17 +176,55 @@ def _compute_fused_io(ops: List[Dict[str, Any]],
         shape = shapes[slot] if slot < len(shapes) else "?"
         dtype = dtypes[slot] if slot < len(dtypes) else "?"
         short = _aten_short(op["aten_op"])
+
+        kind = _classify_input(
+            op, slot, shape, forward_param_names, module_param_shapes)
+
+        if kind == "parameter":
+            param_name = _guess_param_name(op, slot, module_param_shapes)
+            if param_name not in [p["name"] for p in parameter_map]:
+                parameter_map.append({
+                    "name": param_name,
+                    "kind": "parameter",
+                    "sub_op": op["aten_op"],
+                    "sub_op_seq_idx": ops.index(op),
+                    "arg_slot": slot,
+                    "shape": shape,
+                    "dtype": dtype,
+                })
+            input_sources.append(f"{short}[{slot}](param:{param_name})")
+        elif kind == "constant":
+            const_key = (shape, dtype)
+            if const_key not in seen_input_shapes:
+                seen_input_shapes.add(const_key)
+                constant_map.append({
+                    "kind": "constant",
+                    "sub_op": op["aten_op"],
+                    "sub_op_seq_idx": ops.index(op),
+                    "arg_slot": slot,
+                    "shape": shape,
+                    "dtype": dtype,
+                })
+            input_sources.append(f"{short}[{slot}](const)")
+        else:
+            input_key = shape
+            if input_key not in seen_input_shapes and len(input_map) < max_inputs:
+                seen_input_shapes.add(input_key)
+                input_map.append({
+                    "name": _guess_input_name(op, slot, forward_param_names),
+                    "kind": "input",
+                    "sub_op": op["aten_op"],
+                    "sub_op_seq_idx": ops.index(op),
+                    "arg_slot": slot,
+                    "shape": shape,
+                    "dtype": dtype,
+                })
+            input_sources.append(f"{short}[{slot}]")
+
         input_shapes.append(shape)
         input_dtypes.append(dtype)
-        input_sources.append(f"{short}[{slot}]")
-        input_map.append({
-            "sub_op": op["aten_op"],
-            "sub_op_seq_idx": ops.index(op),
-            "arg_slot": slot,
-            "shape": shape,
-            "dtype": dtype,
-        })
 
+    # ── Build output maps ──────────────────────────────────────────────────
     output_shapes, output_dtypes, output_sources = [], [], []
     output_map: List[Dict] = []
 
@@ -195,7 +254,49 @@ def _compute_fused_io(ops: List[Dict[str, Any]],
         "fused_output_sources": " | ".join(output_sources),
         "_input_map": input_map,
         "_output_map": output_map,
+        "_parameter_map": parameter_map,
+        "_constant_map": constant_map,
     }
+
+
+def _classify_input(
+    op: Dict[str, Any],
+    slot: int,
+    shape: str,
+    forward_param_names: Set[str],
+    module_param_shapes: Dict[str, str],
+) -> str:
+    """Classify an external input as 'input', 'parameter', or 'constant'."""
+    if shape in module_param_shapes.values():
+        return "parameter"
+    if shape == "[]" or shape == "[1]" or shape == "1":
+        return "constant"
+    if "Scalar" in op["aten_op"] and slot > 0:
+        return "constant"
+    return "input"
+
+
+def _guess_param_name(
+    op: Dict[str, Any],
+    slot: int,
+    module_param_shapes: Dict[str, str],
+) -> str:
+    shapes = _split_shape_list(op["input_shapes"])
+    shape = shapes[slot] if slot < len(shapes) else "?"
+    for name, pshape in module_param_shapes.items():
+        if pshape == shape:
+            return name
+    return "weight"
+
+
+def _guess_input_name(
+    op: Dict[str, Any],
+    slot: int,
+    forward_param_names: Set[str],
+) -> str:
+    if forward_param_names:
+        return next(iter(forward_param_names))
+    return "hidden_states"
 
 
 def _make_fused_entry(ops: List[Dict[str, Any]], tracker: ModuleTracker,
@@ -216,7 +317,7 @@ def _make_fused_entry(ops: List[Dict[str, Any]], tracker: ModuleTracker,
         fn_parts = first["aten_op"].split(".")
         label = fn_parts[1] if len(fn_parts) >= 2 else first["aten_op"]
 
-    io = _compute_fused_io(ops, graph)
+    io = _compute_fused_io(ops, graph, module_tracker=tracker)
 
     return {
         "fused_op": label,
@@ -274,6 +375,8 @@ class FusionEngine:
                     fused_output_sources=g.get("fused_output_sources", ""),
                     input_map=g.get("_input_map", []),
                     output_map=g.get("_output_map", []),
+                    parameter_map=g.get("_parameter_map", []),
+                    constant_map=g.get("_constant_map", []),
                 )
         return sorted(specs_by_key.values(), key=lambda s: -s.occurrences)
 
@@ -347,7 +450,7 @@ class FusionEngine:
                     parent_class = self._tracker.path_to_class[parent]
                     short = _strip_layer_prefix(parent)
                     aten_ops = list(dict.fromkeys(r["aten_op"] for r in merged_ops))
-                    io = _compute_fused_io(merged_ops, self._graph)
+                    io = _compute_fused_io(merged_ops, self._graph, module_tracker=self._tracker)
                     result.append({
                         "fused_op": f"{short} ({parent_class})",
                         "module_path": parent,

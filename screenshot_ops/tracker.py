@@ -19,7 +19,9 @@ class ModuleTracker:
         self._handles: List[Any] = []
         self.path_to_class: Dict[str, str] = {}
         self.path_to_children: Dict[str, List[str]] = {}
+        self.path_to_module: Dict[str, nn.Module] = {}
         self._install(root, "")
+        self._root = root
 
     def _install(self, module: nn.Module, prefix: str):
         child_paths = []
@@ -27,6 +29,7 @@ class ModuleTracker:
             full_name = f"{prefix}.{name}" if prefix else name
             class_name = type(child).__name__
             self.path_to_class[full_name] = class_name
+            self.path_to_module[full_name] = child
             child_paths.append(full_name)
 
             def _pre_hook(m, inp, _fn=full_name, _cls=class_name):

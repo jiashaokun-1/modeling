@@ -24,9 +24,13 @@ import torch
 
 from screenshot_ops.dispatch import RecordingDispatch, TensorTracker
 from screenshot_ops.excel_writer import ExcelWriter
+from screenshot_ops.fx_graph_adapter import FXGraphAdapter
+from screenshot_ops.fx_tracer import FXTracer
 from screenshot_ops.graph import build_graph
 from screenshot_ops.graph_builder import build_compute_graph
-from screenshot_ops.fusion_pass import FusionRule, FusionPass, export_fusion_rules_json
+from screenshot_ops.fusion_pass import (
+    FusionRule, FusionPass, FusionRuleDiscoverer, export_fusion_rules_json,
+)
 from screenshot_ops.model_loader import load_model
 from screenshot_ops.tracker import ModuleTracker
 
@@ -157,7 +161,7 @@ def run_trace(
     logger.info("Built data-flow graph (%d producers, %d passthroughs).",
                 len(graph.tensor_producer), len(graph.passthroughs))
 
-    # Build NetworkX ComputeGraph for graph-based fusion
+    # Build NetworkX ComputeGraph for graph-based fusion (legacy path)
     compute_graph = build_compute_graph(recorder.records, tensor_tracker.passthroughs)
     logger.info("Built compute graph (%s).", compute_graph)
 
@@ -172,18 +176,36 @@ def run_trace(
     writer = ExcelWriter(tracker, graph)
     writer.write(recorder.records, output_path, config_summary)
 
-    # Apply graph-based fusion using discovered fusion rules
+    # ── Legacy fusion (primary path) ──────────────────────────────────────
     from screenshot_ops.fusion import FusionEngine
     fusion_engine = FusionEngine(tracker, graph)
     fused = fusion_engine.fuse(recorder.records)
     specs = fusion_engine.extract_specs(fused)
     fusion_rules = FusionRule.from_specs(specs)
 
-    fused_graph, fusion_result = FusionPass(fusion_rules).apply(compute_graph)
-    logger.info("Graph fusion: %s", fusion_result.summary())
+    fused_graph, fusion_result = FusionPass(fusion_rules, mode="module_class").apply(compute_graph)
+    logger.info("Legacy graph fusion: %s", fusion_result.summary())
 
     json_path = export_fusion_rules_json(fusion_rules, output_path)
     logger.info("Fusion rules exported to %s", json_path)
+
+    # ── FX-based tracing (experimental, does not override JSON) ───────────
+    try:
+        fx_tracer = FXTracer()
+        gm = fx_tracer.trace(model, input_ids, mask, position_ids)
+
+        adapter = FXGraphAdapter()
+        fx_graph = adapter.convert(gm)
+        logger.info("Built FX compute graph (%s).", fx_graph)
+
+        discoverer = FusionRuleDiscoverer(fx_graph, adapter)
+        fx_rules = discoverer.discover()
+        logger.info("Discovered %d FX fusion rules (experimental).", len(fx_rules))
+
+        fused_graph, fusion_result = FusionPass(fx_rules, mode="fx").apply(fx_graph)
+        logger.info("FX graph fusion: %s", fusion_result.summary())
+    except Exception as exc:
+        logger.warning("FX tracing failed (%s).", exc)
 
     logger.info("Output saved to %s", output_path)
 

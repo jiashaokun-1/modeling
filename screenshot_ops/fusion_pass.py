@@ -1,8 +1,17 @@
 """Graph-based operator fusion driven by JSON fusion rules.
 
-Reads fusion rules (from JSON or FusionSpec list), matches them against a
-ComputeGraph by walking successor chains, and produces a new fused graph
-with correctly merged edges.
+Supports two fusion strategies:
+
+1. **De-fusion (FX-based)**: Given a decomposed FX Graph (from make_fx +
+   core_aten_decompositions), identify sub-sequences of basic ops that
+   correspond to known composite ops (e.g. pow+mean+add+rsqrt+mul+mul →
+   RMSNorm) and merge them back.  This leverages FX Graph's precise
+   node provenance (placeholder = input, get_attr = parameter) to
+   produce accurate input_map / parameter_map / output_map.
+
+2. **Module-class fusion (legacy)**: Group ops by module_class from
+   TorchDispatchMode tracing.  Kept as fallback for models incompatible
+   with make_fx.
 
 Usage::
 
@@ -33,10 +42,11 @@ class FusionRule:
     example_module_path: str = ""
     input_map: List[Dict] = field(default_factory=list)
     output_map: List[Dict] = field(default_factory=list)
+    parameter_map: List[Dict] = field(default_factory=list)
+    constant_map: List[Dict] = field(default_factory=list)
 
     @classmethod
     def from_json(cls, path: str | Path) -> List["FusionRule"]:
-        """Load fusion rules from a JSON file."""
         data = json.loads(Path(path).read_text())
         rules = []
         for entry in data:
@@ -50,12 +60,13 @@ class FusionRule:
                 example_module_path=entry.get("example_module_path", ""),
                 input_map=entry.get("input_map", []),
                 output_map=entry.get("output_map", []),
+                parameter_map=entry.get("parameter_map", []),
+                constant_map=entry.get("constant_map", []),
             ))
         return rules
 
     @classmethod
     def from_specs(cls, specs) -> List["FusionRule"]:
-        """Create FusionRules from FusionSpec objects (fusion.py)."""
         rules = []
         for s in specs:
             rules.append(cls(
@@ -68,11 +79,13 @@ class FusionRule:
                 example_module_path=s.example_module_path,
                 input_map=s.input_map,
                 output_map=s.output_map,
+                parameter_map=getattr(s, "parameter_map", []),
+                constant_map=getattr(s, "constant_map", []),
             ))
         return rules
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "rule_name": self.rule_name,
             "module_class": self.module_class,
             "aten_op_sequence": self.aten_op_sequence,
@@ -83,11 +96,15 @@ class FusionRule:
             "input_map": self.input_map,
             "output_map": self.output_map,
         }
+        if self.parameter_map:
+            d["parameter_map"] = self.parameter_map
+        if self.constant_map:
+            d["constant_map"] = self.constant_map
+        return d
 
 
 @dataclass
 class FusionResult:
-    """Result of applying fusion to a graph."""
     original_nodes: int
     fused_nodes: int
     fusions_applied: List[str] = field(default_factory=list)
@@ -112,28 +129,173 @@ class FusionResult:
 class FusionPass:
     """Apply fusion rules to a ComputeGraph, producing a new fused graph.
 
-    The original graph is not modified.
+    Supports two modes controlled by ``mode``:
+      - ``"fx"``: De-fusion on FX-derived graphs.  Matches op sequences
+        by walking the DAG in topological order and checking if a run of
+        nodes matches a rule's ``aten_op_sequence``.
+      - ``"module_class"``: Legacy module-class grouping (for
+        TorchDispatchMode-derived graphs).
 
-    Algorithm (two-phase, inspired by xPU-simulator FusionPass):
-      1. **Match phase**: Group nodes by ``(module_path, layer)``. Within
-         each group, collect consecutive runs sharing the same
-         ``module_class``. If a run's module_class matches a rule, the
-         entire run is fused (regardless of the exact op sequence, since
-         the run already represents the real op order from the trace).
-      2. **Rewrite phase**: Build a new ComputeGraph. Create fused
-         replacement nodes for matched groups, copy unmatched nodes,
-         then rebuild edges — internal edges within a fused group are
-         dropped, external edges are redirected through the fused node.
+    In both modes, the original graph is not modified.
     """
 
-    def __init__(self, rules: List[FusionRule]):
+    def __init__(self, rules: List[FusionRule], mode: str = "fx"):
         self.rules = rules
+        self.mode = mode
+        self._seq_to_rule: Dict[Tuple[str, ...], FusionRule] = {}
         self._class_to_rule: Dict[str, FusionRule] = {}
         for r in rules:
+            key = tuple(r.aten_op_sequence)
+            if key not in self._seq_to_rule:
+                self._seq_to_rule[key] = r
             if r.module_class:
                 self._class_to_rule[r.module_class] = r
 
     def apply(self, graph: ComputeGraph) -> Tuple[ComputeGraph, FusionResult]:
+        if self.mode == "fx":
+            return self._apply_fx(graph)
+        else:
+            return self._apply_module_class(graph)
+
+    def _apply_fx(self, graph: ComputeGraph) -> Tuple[ComputeGraph, FusionResult]:
+        original_count = graph.num_nodes
+        fusions_applied: List[str] = []
+
+        fused_ids: set = set()
+        pending_fusions: List[Tuple[FusionRule, List[int]]] = []
+
+        order = graph.topo_order()
+
+        i = 0
+        while i < len(order):
+            node_id = order[i]
+            if node_id in fused_ids:
+                i += 1
+                continue
+
+            attrs = graph.node_attrs(node_id)
+            kind = attrs.get("attrs", {}).get("kind", "")
+            if kind != "op":
+                i += 1
+                continue
+
+            op_name = attrs.get("op_name", "")
+            matched = self._try_match_sequence(graph, order, i, fused_ids)
+            if matched is not None:
+                rule, run = matched
+                pending_fusions.append((rule, run))
+                for n in run:
+                    fused_ids.add(n)
+                names = [graph.node_attrs(n).get("name", str(n)) for n in run]
+                fusions_applied.append(
+                    f"{rule.rule_name}({len(run)} ops): {' + '.join(names[:3])}"
+                    + (f" + ... ({len(names) - 3} more)" if len(names) > 3 else "")
+                )
+                i += len(run)
+            else:
+                i += 1
+
+        new_graph = ComputeGraph(graph.name + "_fused")
+        node_map: Dict[int, int] = {}
+        fused_replacement: Dict[int, int] = {}
+
+        for rule, match_node_ids in pending_fusions:
+            first_attrs = graph.node_attrs(match_node_ids[0])
+            last_attrs = graph.node_attrs(match_node_ids[-1])
+
+            fused_name = f"fused_{rule.rule_name}"
+            fused_node_id = new_graph.add_node(
+                op_name=fused_name,
+                name=fused_name,
+                attrs={
+                    "rule_name": rule.rule_name,
+                    "aten_op_sequence": rule.aten_op_sequence,
+                    "num_sub_ops": len(match_node_ids),
+                    "input_map": rule.input_map,
+                    "parameter_map": rule.parameter_map,
+                    "constant_map": rule.constant_map,
+                    "output_map": rule.output_map,
+                    "_matched_node_ids": match_node_ids,
+                },
+            )
+
+            for old_id in match_node_ids:
+                fused_replacement[old_id] = fused_node_id
+
+        for node_id in graph.topo_order():
+            if node_id in fused_ids:
+                continue
+            old_attrs = graph.node_attrs(node_id)
+            new_id = new_graph.add_node(
+                op_name=old_attrs["op_name"],
+                name=old_attrs["name"],
+                attrs=old_attrs.get("attrs", {}),
+            )
+            node_map[node_id] = new_id
+
+        for old_id, new_id in fused_replacement.items():
+            node_map[old_id] = new_id
+
+        seen_edges: set = set()
+        for src_id in graph.topo_order():
+            src_new = node_map.get(src_id)
+            if src_new is None:
+                continue
+            for dst_id in graph.successors(src_id):
+                dst_new = node_map.get(dst_id)
+                if dst_new is None:
+                    continue
+                if src_new == dst_new:
+                    continue
+                edge_key = (src_new, dst_new)
+                if edge_key not in seen_edges:
+                    new_graph.add_edge(src_new, dst_new)
+                    seen_edges.add(edge_key)
+
+        fusion_result = FusionResult(
+            original_nodes=original_count,
+            fused_nodes=new_graph.num_nodes,
+            fusions_applied=fusions_applied,
+        )
+        return new_graph, fusion_result
+
+    def _try_match_sequence(
+        self,
+        graph: ComputeGraph,
+        order: List[int],
+        start_idx: int,
+        fused_ids: set,
+    ) -> Optional[Tuple[FusionRule, List[int]]]:
+        """Try to match any rule's aten_op_sequence starting at order[start_idx]."""
+        for seq_tuple, rule in self._seq_to_rule.items():
+            if len(seq_tuple) == 0:
+                continue
+            op_name = graph.node_attrs(order[start_idx]).get("op_name", "")
+            if op_name != seq_tuple[0]:
+                continue
+
+            run = []
+            idx = start_idx
+            for expected_op in seq_tuple:
+                if idx >= len(order):
+                    break
+                nid = order[idx]
+                if nid in fused_ids:
+                    break
+                n_attrs = graph.node_attrs(nid)
+                if n_attrs.get("attrs", {}).get("kind") != "op":
+                    break
+                if n_attrs.get("op_name") != expected_op:
+                    break
+                run.append(nid)
+                idx += 1
+
+            if len(run) == len(seq_tuple):
+                return rule, run
+
+        return None
+
+    def _apply_module_class(self, graph: ComputeGraph) -> Tuple[ComputeGraph, FusionResult]:
         original_count = graph.num_nodes
         fusions_applied: List[str] = []
 
@@ -207,11 +369,9 @@ class FusionPass:
                     "module_path": first_attrs.get("attrs", {}).get("module_path", ""),
                     "layer": first_attrs.get("attrs", {}).get("layer", ""),
                     "component": first_attrs.get("attrs", {}).get("component", ""),
-                    "input_shapes": first_attrs.get("attrs", {}).get("input_shapes", ""),
-                    "input_dtypes": first_attrs.get("attrs", {}).get("input_dtypes", ""),
-                    "output_shapes": last_attrs.get("attrs", {}).get("output_shapes", ""),
-                    "output_dtypes": last_attrs.get("attrs", {}).get("output_dtypes", ""),
                     "input_map": rule.input_map,
+                    "parameter_map": rule.parameter_map,
+                    "constant_map": rule.constant_map,
                     "output_map": rule.output_map,
                     "_matched_node_ids": match_node_ids,
                 },
@@ -255,15 +415,126 @@ class FusionPass:
             fused_nodes=new_graph.num_nodes,
             fusions_applied=fusions_applied,
         )
-
         return new_graph, fusion_result
+
+
+class FusionRuleDiscoverer:
+    """Auto-discover fusion rules from a ComputeGraph built via FXGraphAdapter.
+
+    Walks the graph in topological order.  When a run of consecutive ``op``
+    nodes has all their non-op predecessors (placeholder / get_attr) in
+    common, the run is a candidate for fusion.  The discoverer groups
+    identical op sequences and records precise input_map / parameter_map /
+    output_map using FXGraphAdapter.extract_io_map().
+    """
+
+    def __init__(self, graph: ComputeGraph, adapter=None):
+        self._graph = graph
+        self._adapter = adapter
+
+    def discover(self) -> List[FusionRule]:
+        order = self._graph.topo_order()
+
+        visited: set = set()
+        runs: List[List[int]] = []
+
+        i = 0
+        while i < len(order):
+            nid = order[i]
+            if nid in visited:
+                i += 1
+                continue
+            attrs = self._graph.node_attrs(nid)
+            kind = attrs.get("attrs", {}).get("kind", "")
+            if kind != "op":
+                i += 1
+                continue
+
+            run = [nid]
+            visited.add(nid)
+            j = i + 1
+            while j < len(order):
+                next_id = order[j]
+                if next_id in visited:
+                    break
+                next_attrs = self._graph.node_attrs(next_id)
+                next_kind = next_attrs.get("attrs", {}).get("kind", "")
+                if next_kind != "op":
+                    break
+                run.append(next_id)
+                visited.add(next_id)
+                j += 1
+
+            if len(run) >= 2:
+                runs.append(run)
+            i = j
+
+        seq_groups: Dict[Tuple[str, ...], List[List[int]]] = {}
+        for run in runs:
+            seq = tuple(self._graph.node_attrs(n).get("op_name", "") for n in run)
+            seq_groups.setdefault(seq, []).append(run)
+
+        rules: List[FusionRule] = []
+        for seq, run_list in seq_groups.items():
+            first_run = run_list[0]
+            rule_name = self._infer_rule_name(seq)
+
+            io_map = {}
+            if self._adapter is not None:
+                io_map = self._adapter.extract_io_map(
+                    first_run, self._graph)
+
+            rule = FusionRule(
+                rule_name=rule_name,
+                module_class=rule_name,
+                aten_op_sequence=list(seq),
+                num_sub_ops=len(seq),
+                fusion_level="leaf",
+                occurrences=len(run_list),
+                input_map=io_map.get("input_map", []),
+                parameter_map=io_map.get("parameter_map", []),
+                constant_map=io_map.get("constant_map", []),
+                output_map=io_map.get("output_map", []),
+            )
+            rules.append(rule)
+
+        return sorted(rules, key=lambda r: -r.occurrences)
+
+    def _infer_rule_name(self, seq: Tuple[str, ...]) -> str:
+        op_shorts = []
+        for op in seq:
+            parts = op.split(".")
+            short = parts[1] if len(parts) >= 2 else op
+            op_shorts.append(short)
+
+        if op_shorts[:2] == ["pow", "mean"]:
+            if "rsqrt" in op_shorts:
+                return "RMSNorm"
+            if "sqrt" in op_shorts:
+                return "LayerNorm"
+
+        if "bmm" in op_shorts and "softmax" in op_shorts:
+            return "Attention"
+
+        if "mm" in op_shorts and "silu" in op_shorts:
+            return "MLP_SiLU"
+
+        if "mm" in op_shorts and "gelu" in op_shorts:
+            return "MLP_GELU"
+
+        if "topk" in op_shorts:
+            return "MoEGate"
+
+        if "cos" in op_shorts and "sin" in op_shorts:
+            return "RoPE"
+
+        return "_".join(op_shorts[:3])
 
 
 def export_fusion_rules_json(
     rules: List[FusionRule],
     output_path: Path,
 ) -> Path:
-    """Export fusion rules to a JSON file alongside the Excel output."""
     json_path = output_path.with_name(output_path.stem + "_fusion_rules.json")
     json_data = [r.to_dict() for r in rules]
     json_path.write_text(json.dumps(json_data, indent=2))
@@ -271,5 +542,4 @@ def export_fusion_rules_json(
 
 
 def load_fusion_rules_json(path: str | Path) -> List[FusionRule]:
-    """Load fusion rules from a JSON file."""
     return FusionRule.from_json(path)

@@ -10,8 +10,8 @@
 HF config.json (几 KB)
        ↓  AutoConfig.from_pretrained
    config 对象
-       ↓  AutoModelForCausalLM.from_config  +  torch.device("meta")
-  模型结构（无权重，全为 meta 张量）
+       ↓  AutoModelForCausalLM.from_config  +  FakeTensorMode
+  模型结构（无权重，全为 FakeTensor）
        ↓  TorchDispatchMode  +  ModuleTracker hooks
   aten 算子序列（形状 / dtype / 模块路径）
        ↓  两阶段融合 + 数据流分析
@@ -19,7 +19,7 @@ HF config.json (几 KB)
   model_ops.xlsx  +  *_fusion_rules.json
 ```
 
-**meta 张量**：只携带形状和 dtype，不分配实际内存，不执行数值计算。整个追踪过程内存占用极低，即使是 671B 参数的 DeepSeek-V3 也能在几秒内完成。
+**FakeTensor**：`torch._subclasses.fake_tensor.FakeTensorMode` 创建的轻量张量，正确追踪形状、dtype 和 strides，不分配实际内存，不执行数值计算。相比旧的 meta device 方案，FakeTensorMode 能正确传播 strides、模拟 cuda device，并减少所需的兼容补丁数量。整个追踪过程内存占用极低，即使是 671B 参数的 DeepSeek-V3 也能在几秒内完成。
 
 ---
 
@@ -397,9 +397,9 @@ MoE 模块的 `forward` 通常在路由阶段调用 `.cpu().numpy()`（如 DeepS
 - **简化策略**：执行 gate（捕获路由算子）→ 运行 `experts[0]`（捕获专家 MLP 算子）→ 处理 shared expert（如有）
 - **返回类型适配**：通过检查原始 `forward` 源码，自动判断是返回单 tensor（DeepSeek / Qwen-MoE 风格）还是 `(hidden, router_logits)` 二元组（Mixtral 风格）
 
-### Autocast Meta 兼容
+### Autocast FakeTensor 兼容
 
-transformers 4.50+ 的 RoPE 实现会将 tensor 的 device type 直接传给 `torch.autocast`，meta device 在 torch 2.x 中不受支持。工具在 `apply_compat_patches()` 中将未知 device type 重定向到 `cpu`（对 meta 张量是 no-op）。
+transformers 4.50+ 的 RoPE 实现会将 tensor 的 device type 直接传给 `torch.autocast`，FakeTensor 模拟的 device（如 `cuda`）在某些 torch 版本中可能不受 autocast 支持。工具在 `apply_compat_patches()` 中将未知 device type 重定向到 `cpu`（对 FakeTensor 是 no-op）。
 
 ### 两阶段算子融合
 

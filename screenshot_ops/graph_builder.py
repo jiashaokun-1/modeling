@@ -46,7 +46,6 @@ def build_compute_graph(
             attrs={
                 "record_idx": rec["idx"],
                 "module_path": rec["module_path"],
-                "module_class": rec["module_class"],
                 "layer": rec["layer"],
                 "component": rec["component"],
                 "input_shapes": rec["input_shapes"],

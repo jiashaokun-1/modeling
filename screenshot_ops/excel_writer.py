@@ -145,7 +145,7 @@ class ExcelWriter:
         fusion_specs = self._fusion_engine.extract_specs(fused)
         ws = wb.create_sheet("Fusion Rules")
         columns = [
-            ("Module Class", 30), ("Fusion Level", 12), ("Aten Op Sequence", 80),
+            ("Module Key", 30), ("Fusion Level", 12), ("Aten Op Sequence", 80),
             ("Sub-ops", 9), ("Occurrences", 12), ("Example Module Path", 55),
             ("Fused Input Shapes", 55), ("Fused Input Dtypes", 30), ("Input Sources", 65),
             ("Fused Output Shapes", 55), ("Fused Output Dtypes", 30), ("Output Sources", 65),
@@ -154,7 +154,7 @@ class ExcelWriter:
 
         for row_idx, spec in enumerate(fusion_specs, 2):
             values = [
-                spec.module_class, spec.fusion_level,
+                spec.module_key, spec.fusion_level,
                 " \u2192 ".join(spec.aten_op_sequence),
                 spec.num_sub_ops, spec.occurrences, spec.example_module_path,
                 spec.fused_input_shapes, spec.fused_input_dtypes, spec.fused_input_sources,
@@ -171,7 +171,7 @@ class ExcelWriter:
         json_path = output_path.with_name(output_path.stem + "_fusion_rules.json")
         json_data = [
             {
-                "module_class": s.module_class,
+                "module_key": s.module_key,
                 "aten_op_sequence": s.aten_op_sequence,
                 "num_sub_ops": s.num_sub_ops,
                 "fusion_level": s.fusion_level,

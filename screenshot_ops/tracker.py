@@ -15,7 +15,6 @@ class ModuleTracker:
 
     def __init__(self, root: nn.Module):
         self._stack: List[str] = []
-        self._class_stack: List[str] = []
         self._handles: List[Any] = []
         self.path_to_class: Dict[str, str] = {}
         self.path_to_children: Dict[str, List[str]] = {}
@@ -32,15 +31,12 @@ class ModuleTracker:
             self.path_to_module[full_name] = child
             child_paths.append(full_name)
 
-            def _pre_hook(m, inp, _fn=full_name, _cls=class_name):
+            def _pre_hook(m, inp, _fn=full_name):
                 self._stack.append(_fn)
-                self._class_stack.append(_cls)
 
             def _post_hook(m, inp, out, _fn=full_name):
                 if self._stack and self._stack[-1] == _fn:
                     self._stack.pop()
-                    if self._class_stack:
-                        self._class_stack.pop()
 
             h1 = child.register_forward_pre_hook(_pre_hook)
             h2 = child.register_forward_hook(_post_hook)
@@ -51,10 +47,6 @@ class ModuleTracker:
     @property
     def current_module(self) -> str:
         return self._stack[-1] if self._stack else ""
-
-    @property
-    def current_module_class(self) -> str:
-        return self._class_stack[-1] if self._class_stack else ""
 
     def remove(self):
         for h in self._handles:

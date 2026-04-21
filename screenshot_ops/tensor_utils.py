@@ -24,6 +24,9 @@ SKIP_OPS = {
     "aten.histc.default", "aten.cumsum.default",
     "aten.bitwise_not.default",
     "aten.sort.default", "aten.sort.stable",
+    "aten._to_copy.default",
+    "aten.copy_.default",
+    "prim.device.default",
 }
 
 

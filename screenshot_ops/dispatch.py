@@ -19,7 +19,7 @@ from screenshot_ops.classifier import extract_layer_idx, classify_component
 class TensorTracker:
     """Assign stable unique IDs to tensors seen during tracing.
 
-    id(tensor) is not reliable on meta device, so we maintain our own counter.
+    id(tensor) is not reliable on meta/FakeTensor, so we maintain our own counter.
 
     Also maintains ``passthroughs``: for every skip op (view/reshape/etc.) we
     record  output_tensor_id → input_tensor_id  so that the DataFlowGraph can
@@ -29,7 +29,7 @@ class TensorTracker:
     def __init__(self):
         self._counter = 0
         self._id_map: Dict[int, int] = {}
-        self.passthroughs: Dict[int, int] = {}   # skip-op output_id → input_id
+        self.passthroughs: Dict[int, int] = {}
 
     def reset(self):
         self._counter = 0
@@ -69,17 +69,13 @@ class RecordingDispatch(TorchDispatchMode):
         output_ids = [self.tensor_tracker.get_id(t) for t in output_tensors]
 
         if self._skip_reshapes and func_name in SKIP_OPS:
-            # Record passthrough: each skip-op output inherits its input's ID,
-            # so the DataFlowGraph can resolve chains through skipped ops.
             for out_id, in_id in zip(output_ids, input_ids[:len(output_ids)]):
                 self.tensor_tracker.passthroughs[out_id] = in_id
             return out
 
         module_path = ""
-        module_class = ""
         if self._module_tracker:
             module_path = self._module_tracker.current_module
-            module_class = self._module_tracker.current_module_class
 
         input_shapes = [shape_str(t) for t in input_tensors]
         input_dtypes = [str(t.dtype) for t in input_tensors]
@@ -90,7 +86,6 @@ class RecordingDispatch(TorchDispatchMode):
             "idx": len(self.records),
             "aten_op": func_name,
             "module_path": module_path,
-            "module_class": module_class,
             "layer": extract_layer_idx(module_path),
             "component": classify_component(module_path, func_name),
             "input_shapes": ", ".join(input_shapes),

@@ -1,4 +1,4 @@
-"""Load any HuggingFace causal LM onto meta device for op-sequence tracing.
+"""Load any HuggingFace causal LM for op-sequence tracing.
 
 Supports:
   - HF Hub model IDs  (``deepseek-ai/DeepSeek-V3``, ``Qwen/Qwen3-8B``, …)
@@ -10,8 +10,10 @@ Supports:
 Compatibility patches applied here:
   - Deprecated transformers internals (is_torch_fx_available, etc.)
   - torch.autocast with device_type='meta' (transformers 4.50+ RoPE issue)
-  - Generic MoE forward replacement (avoids .cpu().numpy() on meta tensors)
-  - DeepSeek-V3.2 Indexer forward replacement
+
+No MoE patches needed — FakeTensorMode handles all ops natively.
+Indexer patch still required — V3.2 modeling file has a shape bug.
+MoE patch still required — ``.cpu().numpy()`` is not supported on FakeTensors.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -76,7 +78,6 @@ def apply_compat_patches() -> None:
 
 def _normalize_config(config: Any) -> None:
     """Apply generic compatibility fixes to a PretrainedConfig in-place."""
-    # rope_scaling: older modeling code reads 'type'; newer configs write 'rope_type'
     rs = getattr(config, "rope_scaling", None)
     if isinstance(rs, dict) and "rope_type" in rs and "type" not in rs:
         rs["type"] = rs["rope_type"]
@@ -90,12 +91,11 @@ def _is_moe_module(module: nn.Module) -> bool:
     return (
         isinstance(experts, nn.ModuleList)
         and any(e is not None for e in experts)
-        and not getattr(module, "_meta_patched", False)
+        and not getattr(module, "_fake_patched", False)
     )
 
 
 def _returns_router_tuple(mod: nn.Module) -> bool:
-    """True if this MoE forward returns (hidden, router_logits) tuple."""
     try:
         src = inspect.getsource(type(mod).forward)
         if any(pat in src for pat in ("router_logits", "aux_loss",
@@ -106,20 +106,25 @@ def _returns_router_tuple(mod: nn.Module) -> bool:
     return hasattr(mod, "router") and not hasattr(mod, "gate")
 
 
-def patch_moe_for_meta(model: nn.Module) -> None:
-    """Replace MoE forwards with a meta-tensor-safe simplified version."""
+def patch_moe_for_fake(model: nn.Module) -> None:
+    """Replace MoE forwards with a FakeTensor-safe simplified version.
+
+    The original MoE forward calls ``.cpu().numpy()`` on routing indices,
+    which is not supported on FakeTensors.  We replace it with a simplified
+    version that only runs 1 expert + shared expert.
+    """
     patched = 0
     for _, module in model.named_modules():
         if not _is_moe_module(module):
             continue
-        module._meta_patched = True
-        module.forward = _make_meta_moe_forward(module)
+        module._fake_patched = True
+        module.forward = _make_fake_moe_forward(module)
         patched += 1
     if patched:
-        logger.info("Applied meta-tensor MoE patch to %d module(s).", patched)
+        logger.info("Applied FakeTensor MoE patch to %d module(s).", patched)
 
 
-def _make_meta_moe_forward(mod: nn.Module):
+def _make_fake_moe_forward(mod: nn.Module):
     _tuple_return = _returns_router_tuple(mod)
 
     def _forward(hidden_states: torch.Tensor, *args: Any, **kwargs: Any):
@@ -127,7 +132,7 @@ def _make_meta_moe_forward(mod: nn.Module):
             result = _impl(hidden_states)
             return (result, None) if _tuple_return else result
         except Exception as exc:
-            logger.debug("Meta MoE forward error (%s) — returning identity.", exc)
+            logger.debug("Fake MoE forward error (%s) — returning identity.", exc)
             return (hidden_states, None) if _tuple_return else hidden_states
 
     def _impl(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -187,34 +192,28 @@ def _make_meta_moe_forward(mod: nn.Module):
 # ── DeepSeek-V3.2 Indexer patch ───────────────────────────────────────────────
 
 def _patch_indexer_forward(IndexerClass: type) -> None:
-    """Patch DeepSeek-V3.2 Indexer to work on meta device.
+    """Patch DeepSeek-V3.2 Indexer to fix a shape bug in the modeling file.
 
     The V3.2 modeling file's own simplified forward contains a shape bug
     (``k_nope.transpose(1,2).transpose(2,3)`` on a 3D tensor fails).
     We always replace it with this correct implementation.
-
-    Shapes with index_n_heads=64, index_head_dim=128, rope_head_dim=64:
-      q_nope : (bsz, heads=64, seqlen, nope_dim=64)
-      k_nope : (bsz, heads=64, nope_dim=64, seqlen)  ← note transpose order
-      scores : (bsz, 64, seqlen, seqlen)
     """
-    def _indexer_forward_meta(self, x, qr, position_ids=None, attention_mask=None):
+    def _indexer_forward(self, x, qr, position_ids=None, attention_mask=None):
         bsz, seqlen, _ = x.size()
         nope_dim = self.index_head_dim - self.rope_head_dim
 
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, self.index_n_heads, self.index_head_dim)
         _q_pe, q_nope = torch.split(q, [self.rope_head_dim, nope_dim], dim=-1)
-        q_nope = q_nope.transpose(1, 2)  # (bsz, heads, seqlen, nope_dim)
+        q_nope = q_nope.transpose(1, 2)
 
         k = self.wk(x)
         k = self.k_norm(k)
         _k_pe, k_nope = torch.split(k, [self.rope_head_dim, nope_dim], dim=-1)
-        # k_nope: (bsz, seqlen, nope_dim) → broadcast over heads
         k_nope = k_nope.unsqueeze(1).expand(-1, self.index_n_heads, -1, -1)
-        k_nope = k_nope.transpose(2, 3)  # (bsz, heads, nope_dim, seqlen)
+        k_nope = k_nope.transpose(2, 3)
 
-        scores = torch.matmul(q_nope, k_nope)  # (bsz, heads, seqlen, seqlen)
+        scores = torch.matmul(q_nope, k_nope)
         if attention_mask is not None:
             scores = scores + attention_mask
         scores = torch.nn.functional.softmax(
@@ -222,7 +221,7 @@ def _patch_indexer_forward(IndexerClass: type) -> None:
         topk_indices = scores.topk(min(self.index_topk, seqlen), dim=-1)[1]
         return topk_indices
 
-    IndexerClass.forward = _indexer_forward_meta
+    IndexerClass.forward = _indexer_forward
 
 
 # ── Local custom-architecture loader ──────────────────────────────────────────
@@ -239,7 +238,6 @@ def _load_local_custom(model_dir: Path, num_hidden_layers: int):
     2. Instantiate the config class directly from config.json.
     3. Instantiate the first causal-LM class from the modeling module.
     """
-    # Find the first Config class in configuration_deepseek
     parent = str(model_dir.parent)
     pkg_name = model_dir.name
 
@@ -255,7 +253,6 @@ def _load_local_custom(model_dir: Path, num_hidden_layers: int):
         _added = False
 
     try:
-        # Re-import in case module was partially loaded before
         for mod_key in list(sys.modules.keys()):
             if mod_key.startswith(pkg_name + "."):
                 del sys.modules[mod_key]
@@ -270,7 +267,6 @@ def _load_local_custom(model_dir: Path, num_hidden_layers: int):
         if _added and parent in sys.path:
             sys.path.remove(parent)
 
-    # Find config class (first PretrainedConfig subclass)
     from transformers import PretrainedConfig
     ConfigClass = None
     for name in dir(cfg_mod):
@@ -282,7 +278,6 @@ def _load_local_custom(model_dir: Path, num_hidden_layers: int):
     if ConfigClass is None:
         raise RuntimeError(f"No PretrainedConfig subclass found in {pkg_name}.configuration_deepseek")
 
-    # Find CausalLM class
     CausalLMClass = None
     for name in dir(mdl_mod):
         if "ForCausalLM" in name:
@@ -295,13 +290,11 @@ def _load_local_custom(model_dir: Path, num_hidden_layers: int):
 
     raw = json.loads((model_dir / "config.json").read_text())
 
-    # rope_scaling compat: older models need 'type' key
     rs = raw.get("rope_scaling")
     if isinstance(rs, dict) and "rope_type" in rs and "type" not in rs:
         rs["type"] = rs["rope_type"]
     original_rope_scaling = raw.get("rope_scaling")
 
-    # Build config — only pass known keys to avoid TypeError
     default_keys = set(ConfigClass().__dict__.keys())
     config = ConfigClass(**{
         k: v for k, v in raw.items()
@@ -314,10 +307,9 @@ def _load_local_custom(model_dir: Path, num_hidden_layers: int):
     config._full_num_hidden_layers = getattr(config, "num_hidden_layers", None)
     config.num_hidden_layers = num_hidden_layers
 
-    logger.info("Instantiating %s on meta device (%d layers) …",
+    logger.info("Instantiating %s on CPU (%d layers) …",
                 type(config).__name__, num_hidden_layers)
-    with torch.device("meta"):
-        model = CausalLMClass(config)
+    model = CausalLMClass(config)
     model.eval()
     return model, config
 
@@ -328,7 +320,10 @@ def load_model(
     model_id: str,
     num_hidden_layers: int = 4,
 ) -> Tuple[nn.Module, Any]:
-    """Load any HF causal LM onto meta device for op-sequence tracing.
+    """Load any HF causal LM for op-sequence tracing.
+
+    The model is instantiated on CPU.  During tracing, FakeTensorMode
+    converts all tensors to FakeTensors (no real computation, no GPU needed).
 
     Parameters
     ----------
@@ -342,7 +337,7 @@ def load_model(
     Returns
     -------
     (model, config)
-        model  — on meta device, eval mode, MoE-patched.
+        model  — on CPU, eval mode.
         config — ``config._full_num_hidden_layers`` stores the original depth.
     """
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -355,8 +350,6 @@ def load_model(
     config = None
     model = None
 
-    # Try standard AutoConfig first; fall back to local importlib loader
-    # for custom architectures that have no auto_map (deepseek_v3, deepseek_v32)
     try:
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     except (ValueError, KeyError) as exc:
@@ -371,21 +364,21 @@ def load_model(
         config.num_hidden_layers = num_hidden_layers
         _normalize_config(config)
 
-        logger.info("Instantiating %s on meta device (%d layers) …",
+        logger.info("Instantiating %s on CPU (%d layers) …",
                     type(config).__name__, num_hidden_layers)
-        with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
         model.eval()
 
-    patch_moe_for_meta(model)
+    _patch_indexer(model)
+    patch_moe_for_fake(model)
 
-    # Patch Indexer forward (DeepSeek-V3.2) — always applied when found,
-    # because the modeling file's own simplified forward has a shape bug.
+    return model, config
+
+
+def _patch_indexer(model: nn.Module) -> None:
     for _, module in model.named_modules():
         cls_name = type(module).__name__
         if "Indexer" in cls_name and hasattr(module, "wq_b"):
             _patch_indexer_forward(type(module))
             logger.debug("Patched Indexer forward: %s", cls_name)
             break
-
-    return model, config

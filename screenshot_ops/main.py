@@ -20,32 +20,24 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-
-from screenshot_ops.dispatch import RecordingDispatch, TensorTracker
 from screenshot_ops.excel_writer import ExcelWriter
-from screenshot_ops.fx_graph_adapter import FXGraphAdapter
-from screenshot_ops.fx_tracer import FXTracer
-from screenshot_ops.graph import build_graph
-from screenshot_ops.graph_builder import build_compute_graph
-from screenshot_ops.fusion_pass import (
-    FusionRule, FusionPass, FusionRuleDiscoverer, export_fusion_rules_json,
+from screenshot_ops.fused_discovery import (
+    CaptureResult,
+    capture_ops,
+    discover_fusion_rules,
+    write_fusion_rules,
 )
 from screenshot_ops.model_loader import load_model
-from screenshot_ops.tracker import ModuleTracker
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 logger = logging.getLogger(__name__)
 
-# Backward-compat map for --model v3 / v3.2 shorthand
 _MODEL_DIRS = {
     "v3":  "deepseek_v3",
     "v3.2": "deepseek_v3_2",
 }
 
-
-# ── Public helpers ─────────────────────────────────────────────────────────────
 
 def build_config_summary(
     model_id: str,
@@ -54,12 +46,7 @@ def build_config_summary(
     batch_size: int,
     seq_len: int,
 ) -> Dict[str, Any]:
-    """Return a config dict suitable for the Excel Model Config sheet.
-
-    Always includes ``model_id``, ``model_type``, ``hidden_size``,
-    ``num_attention_heads``, and ``vocab_size``.  Architecture-specific
-    fields (MLA ranks, MoE counts, etc.) are included when present.
-    """
+    """Return a config dict suitable for the Excel Model Config sheet."""
     def _get(attr: str) -> Any:
         return getattr(config, attr, None)
 
@@ -78,7 +65,6 @@ def build_config_summary(
         "seq_len": seq_len,
     }
 
-    # Optional architecture-specific fields
     for field in (
         "moe_intermediate_size",
         "q_lora_rank", "kv_lora_rank",
@@ -103,67 +89,15 @@ def run_trace(
     seq_len: int = 128,
     output_path: Optional[Any] = None,
 ) -> Tuple[Path, List[Dict[str, Any]]]:
-    """Load *model_id*, trace one forward pass, write Excel, return results.
-
-    Parameters
-    ----------
-    model_id:
-        HF Hub ID or local directory path.
-    num_layers:
-        Number of transformer blocks to instantiate (2–4 covers all op patterns).
-    batch_size:
-        Dummy input batch size.
-    seq_len:
-        Dummy input sequence length.
-    output_path:
-        Path for the output ``.xlsx`` file.  Defaults to
-        ``<model_slug>_ops.xlsx`` in the current directory.
-
-    Returns
-    -------
-    (output_path, records)
-        output_path — ``Path`` to the written Excel file.
-        records     — list of op-record dicts (``aten_op``, ``component``,
-                      ``layer``, ``module_path``, shape/dtype fields, …).
-    """
+    """Load *model_id*, trace one forward pass, write Excel, return results."""
     logger.info("Loading model %s (%d layers) …", model_id, num_layers)
     model, config = load_model(model_id, num_hidden_layers=num_layers)
 
-    input_ids = torch.randint(
-        0, config.vocab_size, (batch_size, seq_len), device="meta")
-    position_ids = torch.arange(seq_len, device="meta").unsqueeze(0)
-    mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device="meta")
-    mask = torch.triu(mask, diagonal=1)
-
-    logger.info("Tracing forward pass (batch=%d, seq=%d) …", batch_size, seq_len)
-    tensor_tracker = TensorTracker()
-    tracker = ModuleTracker(model)
-    recorder = RecordingDispatch(
-        tensor_tracker=tensor_tracker,
-        module_tracker=tracker,
-        skip_reshapes=True,
+    capture = capture_ops(
+        model, config,
+        batch_size=batch_size, seq_len=seq_len,
+        model_id=model_id, num_layers=num_layers,
     )
-    try:
-        with recorder, torch.no_grad():
-            model(
-                input_ids=input_ids,
-                attention_mask=mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-    finally:
-        tracker.remove()
-
-    logger.info("Captured %d ops.", len(recorder.records))
-
-    # Build lightweight data-flow graph for correct fusion I/O resolution
-    graph = build_graph(recorder.records, tensor_tracker.passthroughs)
-    logger.info("Built data-flow graph (%d producers, %d passthroughs).",
-                len(graph.tensor_producer), len(graph.passthroughs))
-
-    # Build NetworkX ComputeGraph for graph-based fusion (legacy path)
-    compute_graph = build_compute_graph(recorder.records, tensor_tracker.passthroughs)
-    logger.info("Built compute graph (%s).", compute_graph)
 
     config_summary = build_config_summary(
         model_id, config, num_layers, batch_size, seq_len)
@@ -173,56 +107,26 @@ def run_trace(
         output_path = Path(f"{slug}_ops.xlsx")
     output_path = Path(output_path)
 
-    writer = ExcelWriter(tracker, graph)
-    writer.write(recorder.records, output_path, config_summary)
+    writer = ExcelWriter(capture.tracker, capture.graph)
+    writer.write(capture.records, output_path, config_summary)
 
-    # ── Legacy fusion (primary path) ──────────────────────────────────────
-    from screenshot_ops.fusion import FusionEngine
-    fusion_engine = FusionEngine(tracker, graph)
-    fused = fusion_engine.fuse(recorder.records)
-    specs = fusion_engine.extract_specs(fused)
-    fusion_rules = FusionRule.from_specs(specs)
-
-    fused_graph, fusion_result = FusionPass(fusion_rules, mode="module_class").apply(compute_graph)
-    logger.info("Legacy graph fusion: %s", fusion_result.summary())
-
-    json_path = export_fusion_rules_json(fusion_rules, output_path)
-    logger.info("Fusion rules exported to %s", json_path)
-
-    # ── FX-based tracing (experimental, does not override JSON) ───────────
-    try:
-        fx_tracer = FXTracer()
-        gm = fx_tracer.trace(model, input_ids, mask, position_ids)
-
-        adapter = FXGraphAdapter()
-        fx_graph = adapter.convert(gm)
-        logger.info("Built FX compute graph (%s).", fx_graph)
-
-        discoverer = FusionRuleDiscoverer(fx_graph, adapter)
-        fx_rules = discoverer.discover()
-        logger.info("Discovered %d FX fusion rules (experimental).", len(fx_rules))
-
-        fused_graph, fusion_result = FusionPass(fx_rules, mode="fx").apply(fx_graph)
-        logger.info("FX graph fusion: %s", fusion_result.summary())
-    except Exception as exc:
-        logger.warning("FX tracing failed (%s).", exc)
+    fusion_rules, fused_graph, fusion_result = discover_fusion_rules(capture)
+    json_path = write_fusion_rules(fusion_rules, output_path)
 
     logger.info("Output saved to %s", output_path)
 
-    return output_path, recorder.records
+    return output_path, capture.records
 
-
-# ── CLI entry point ────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Trace LLM operator sequences and write Excel report.")
     parser.add_argument(
         "model_id", nargs="?",
-        help="HF Hub model ID or local directory (e.g. deepseek-ai/DeepSeek-V3-0324)")
+        help="HF Hub model ID or local directory")
     parser.add_argument(
         "--model", choices=_MODEL_DIRS.keys(),
-        help="Shorthand for local DeepSeek model: v3 or v3.2 (backward compat)")
+        help="Shorthand for local DeepSeek model: v3 or v3.2")
     parser.add_argument("--layers", type=int, default=4,
                         help="Number of transformer layers to trace (default: 4)")
     parser.add_argument("--batch-size", type=int, default=1,
@@ -230,10 +134,9 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=128,
                         help="Dummy input sequence length (default: 128)")
     parser.add_argument("--output", "-o",
-                        help="Output .xlsx path (default: <model_slug>_ops.xlsx)")
+                        help="Output .xlsx path")
     args = parser.parse_args()
 
-    # Resolve model_id: positional takes precedence over --model shorthand
     if args.model_id:
         model_id = args.model_id
     elif args.model:

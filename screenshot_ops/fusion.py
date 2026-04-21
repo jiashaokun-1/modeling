@@ -1,4 +1,4 @@
-"""Two-pass automatic operator fusion using module hierarchy."""
+"""Automatic operator fusion using module hierarchy."""
 from __future__ import annotations
 
 import inspect
@@ -8,13 +8,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from screenshot_ops.tracker import ModuleTracker
 
-MAX_PARENT_FUSE_OPS = 30
-
 
 @dataclass
 class FusionSpec:
     """A fusion pattern auto-discovered from dispatch tracing."""
-    module_class: str
+    module_key: str
     aten_op_sequence: List[str]
     num_sub_ops: int
     fusion_level: str
@@ -57,6 +55,12 @@ def _split_shape_list(s: str) -> List[str]:
 
 
 def _strip_layer_prefix(module_path: str) -> str:
+    """Remove the 'model.layers.N.' prefix from a module path.
+
+    'model.layers.0.input_layernorm' → 'input_layernorm'
+    'model.layers.0.self_attn.q_a_layernorm' → 'self_attn.q_a_layernorm'
+    'model.norm' → 'norm'
+    """
     parts = module_path.split(".")
     for i, p in enumerate(parts):
         if p == "layers" and i + 1 < len(parts):
@@ -104,7 +108,6 @@ def _compute_fused_io(ops: List[Dict[str, Any]],
     group_indices = {op["idx"] for op in ops}
 
     module_path = ops[0].get("module_path", "")
-    module_class = ops[0].get("module_class", "")
 
     forward_param_names: Set[str] = set()
     module_param_shapes: Dict[str, str] = {}
@@ -304,15 +307,14 @@ def _make_fused_entry(ops: List[Dict[str, Any]], tracker: ModuleTracker,
                       graph=None) -> Dict[str, Any]:
     first, last = ops[0], ops[-1]
     path = first["module_path"]
-    module_class = tracker.path_to_class.get(path, first.get("module_class", ""))
+    module_key = _strip_layer_prefix(path) if path else ""
 
     aten_ops = list(dict.fromkeys(r["aten_op"] for r in ops))
 
-    short_path = _strip_layer_prefix(path) if path else ""
-    if module_class and len(ops) > 1:
-        label = f"{short_path} ({module_class})"
-    elif short_path:
-        label = short_path
+    if module_key and len(ops) > 1:
+        label = module_key
+    elif module_key:
+        label = module_key
     else:
         fn_parts = first["aten_op"].split(".")
         label = fn_parts[1] if len(fn_parts) >= 2 else first["aten_op"]
@@ -322,12 +324,11 @@ def _make_fused_entry(ops: List[Dict[str, Any]], tracker: ModuleTracker,
     return {
         "fused_op": label,
         "module_path": path,
-        "module_class": module_class,
+        "module_key": module_key,
         "fusion_level": fusion_level,
         "aten_ops": " \u2192 ".join(aten_ops),
         "num_sub_ops": len(ops),
         "layer": first["layer"],
-        # Keep legacy fields for backward compat (first/last shapes)
         "input_shapes": first["input_shapes"],
         "input_dtypes": first["input_dtypes"],
         "output_shapes": last["output_shapes"],
@@ -338,11 +339,11 @@ def _make_fused_entry(ops: List[Dict[str, Any]], tracker: ModuleTracker,
 
 
 class FusionEngine:
-    """Two-pass automatic fusion using module hierarchy."""
+    """Automatic fusion using module hierarchy."""
 
     def __init__(self, tracker: ModuleTracker, graph=None):
         self._tracker = tracker
-        self._graph = graph  # DataFlowGraph or None
+        self._graph = graph
 
     def fuse(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         groups = self._pass1_leaf(records)
@@ -356,12 +357,12 @@ class FusionEngine:
         for g in fused:
             if g["num_sub_ops"] <= 1:
                 continue
-            key = (g["module_class"], g["fusion_level"])
+            key = (g["module_key"], g["fusion_level"])
             if key in specs_by_key:
                 specs_by_key[key].occurrences += 1
             else:
                 specs_by_key[key] = FusionSpec(
-                    module_class=g["module_class"],
+                    module_key=g["module_key"],
                     aten_op_sequence=g["aten_ops"].split(" \u2192 "),
                     num_sub_ops=g["num_sub_ops"],
                     fusion_level=g["fusion_level"],
@@ -398,78 +399,3 @@ class FusionEngine:
         groups.append(_make_fused_entry(
             current_group, self._tracker, "leaf", self._graph))
         return groups
-
-    def _pass2_parent(self, groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not groups:
-            return []
-
-        parent_child_count: Dict[str, set] = defaultdict(set)
-        parent_total_ops: Dict[str, int] = defaultdict(int)
-        for g in groups:
-            p = _parent_path(g["module_path"])
-            if p:
-                parent_child_count[p].add(g["module_path"])
-                parent_total_ops[p] += g["num_sub_ops"]
-
-        def _is_fusible_parent(parent: str) -> bool:
-            if parent not in self._tracker.path_to_class:
-                return False
-            children = self._tracker.path_to_children.get(parent, [])
-            if not children:
-                return False
-            if len(parent_child_count.get(parent, set())) > 5:
-                return False
-            if parent_total_ops.get(parent, 0) > MAX_PARENT_FUSE_OPS:
-                return False
-            return True
-
-        result = []
-        i = 0
-        while i < len(groups):
-            parent = _parent_path(groups[i]["module_path"])
-
-            if parent and _is_fusible_parent(parent):
-                j = i + 1
-                total_ops = groups[i]["num_sub_ops"]
-                while j < len(groups):
-                    g = groups[j]
-                    g_parent = _parent_path(g["module_path"])
-                    if ((g_parent == parent or g["module_path"] == parent)
-                            and g["layer"] == groups[i]["layer"]):
-                        total_ops += g["num_sub_ops"]
-                        if total_ops > MAX_PARENT_FUSE_OPS:
-                            break
-                        j += 1
-                    else:
-                        break
-
-                if j > i + 1:
-                    merged_ops = []
-                    for g in groups[i:j]:
-                        merged_ops.extend(g["_children"])
-                    parent_class = self._tracker.path_to_class[parent]
-                    short = _strip_layer_prefix(parent)
-                    aten_ops = list(dict.fromkeys(r["aten_op"] for r in merged_ops))
-                    io = _compute_fused_io(merged_ops, self._graph, module_tracker=self._tracker)
-                    result.append({
-                        "fused_op": f"{short} ({parent_class})",
-                        "module_path": parent,
-                        "module_class": parent_class,
-                        "fusion_level": "parent",
-                        "aten_ops": " \u2192 ".join(aten_ops),
-                        "num_sub_ops": len(merged_ops),
-                        "layer": groups[i]["layer"],
-                        "input_shapes": merged_ops[0]["input_shapes"],
-                        "input_dtypes": merged_ops[0]["input_dtypes"],
-                        "output_shapes": merged_ops[-1]["output_shapes"],
-                        "output_dtypes": merged_ops[-1]["output_dtypes"],
-                        **io,
-                        "_children": merged_ops,
-                    })
-                    i = j
-                    continue
-
-            result.append(groups[i])
-            i += 1
-
-        return result

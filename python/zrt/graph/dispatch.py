@@ -103,16 +103,25 @@ class RecordingDispatch(TorchDispatchMode):
 
     def __init__(self, tensor_tracker: TensorTracker,
                  module_tracker: Optional[ModuleTracker] = None,
-                 skip_reshapes: bool = True):
+                 skip_reshapes: bool = True,
+                 active: bool = True,
+                 target_layers: Optional[List[int]] = None):
         super().__init__()
         self.tensor_tracker = tensor_tracker
         self.records: List[Dict[str, Any]] = []
         self._module_tracker = module_tracker
         self._skip_reshapes = skip_reshapes
+        self.active = active
+        self._target_layers: Optional[set] = (
+            set(target_layers) if target_layers is not None else None
+        )
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         out = func(*args, **kwargs)
+
+        if not self.active:
+            return out
 
         func_name = str(func.overloadpacket) + "." + func._overloadname
         try:
@@ -135,6 +144,11 @@ class RecordingDispatch(TorchDispatchMode):
             module_path = self._module_tracker.current_module
             module_class = self._module_tracker.current_module_class
 
+        if self._target_layers is not None:
+            layer_str = extract_layer_idx(module_path)
+            if layer_str and int(layer_str) not in self._target_layers:
+                return out
+
         input_shapes = [shape_str(t) for t in input_tensors]
         input_dtypes = [str(t.dtype) for t in input_tensors]
         output_shapes = [shape_str(t) for t in output_tensors]
@@ -142,6 +156,9 @@ class RecordingDispatch(TorchDispatchMode):
 
         src_file, src_line, src_code, src_func = _capture_call_site()
         extra_args = _collect_extra_args(func, args, kwargs)
+        in_recompute = (
+            self._module_tracker.in_recompute if self._module_tracker else False
+        )
 
         self.records.append({
             "node_id": len(self.records),
@@ -164,6 +181,7 @@ class RecordingDispatch(TorchDispatchMode):
             "num_outputs": len(output_tensors),
             "_input_ids": input_ids,
             "_output_ids": output_ids,
+            "recompute": in_recompute,
         })
 
         return out

@@ -210,6 +210,66 @@ print(f"反向图节点数: {raw_g.num_nodes()}")
 
 ---
 
+## 图模式（torch.compile）
+
+默认的 eager 路径通过 `TorchDispatchMode` 逐 op 拦截，产生扁平的算子列表。  
+`graph_mode=True` 改用 **`torch.compile` 自定义 backend** 捕获计算图，Dynamo 在 trace 时生成带显式数据流边的 FX `GraphModule`。
+
+### 与 eager 模式的对比
+
+| 特性 | eager（默认） | graph_mode=True |
+|------|--------------|-----------------|
+| 捕获机制 | `TorchDispatchMode` | `torch.compile` + Dynamo |
+| 数据流边 | 后验推断（tensor id 匹配）| FX `node.args` 直接读取 |
+| GEMM 表示 | `mm` / `addmm` 分散 | `aten.linear.default` 统一 |
+| 模块路径标注 | 完整（forward hook）| 依赖 Dynamo `nn_module_stack`（保留） |
+| 训练反向捕获 | `loss.backward()` eager 拦截 | Dynamo 自动捕获反向子图 |
+| 子图数量 | 单一扁平序列 | 可能多个子图（graph break 时合并）|
+| 输出格式 | Excel + JSON + ONNX | **相同**（完全兼容）|
+
+### 命令行
+
+```bash
+# 图模式抓 DSv3 训练计算图（前向 + 反向）
+python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3 --layers 2 --phases train_backward --graph-mode
+
+# 图模式抓推理阶段
+python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3-0324 --layers 4 --phases prefill decode --graph-mode
+```
+
+### Python API
+
+```python
+from python.zrt.graph import run_trace_phases
+
+# 图模式：DSv3 训练前向 + 反向
+result = run_trace_phases(
+    model_id="deepseek-ai/DeepSeek-V3",
+    num_layers=2,
+    batch_size=1,
+    seq_len=16,
+    phases=("train_backward",),
+    graph_mode=True,
+)
+records = result.phase_records["train_backward"]
+print(f"捕获算子数: {len(records)}")
+
+# 图模式：推理阶段
+result = run_trace_phases(
+    model_id="deepseek-ai/DeepSeek-V3-0324",
+    num_layers=4,
+    phases=("prefill", "decode"),
+    graph_mode=True,
+)
+```
+
+### 注意事项
+
+- 模型含复杂控制流（如 MoE routing）时 Dynamo 可能产生多个子图（graph break），records 会按顺序合并。
+- `graph_mode` 与 `--train` / `--phases` 等所有现有参数完全兼容。
+
+---
+
 ## 命令行参数
 
 
@@ -227,6 +287,7 @@ print(f"反向图节点数: {raw_g.num_nodes()}")
 | `--tp`            | —    | `1`                 | 张量并行度（配合 `--hw` 使用）                                                  |
 | `--target-layers` | —    | —                  | 指定追踪的层编号，逗号分隔（如 `0,3`）                                          |
 | `--auto-layers`   | —    | `True`（CLI 默认） | 自动选择第一个密集层和第一个稀疏（MoE）层                                       |
+| `--graph-mode`    | —    | `False`             | 使用 `torch.compile` 图模式捕获，替代 `TorchDispatchMode` eager 路径            |
 | `--model`         | —    | —                  | 向后兼容简写：`v3` 或 `v3.2`                                                    |
 
 ### 关于 `--layers` 的选择

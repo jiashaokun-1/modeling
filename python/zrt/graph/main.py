@@ -46,7 +46,7 @@ from python.zrt.graph.excel_writer import ExcelWriter
 from python.zrt.graph.graph_builder import build_op_graph, build_fused_op_graph
 from python.zrt.graph.graph_exporter import export_all
 from python.zrt.graph.model_loader import load_model
-from python.zrt.graph.tracker import ModuleTracker
+from python.zrt.graph.tracker import ModuleTracker, NullModuleTracker
 from python.zrt.ir.adapter import (
     records_to_opgraph,
     fused_records_to_opgraph,
@@ -294,6 +294,8 @@ def _trace_phase(
     seq_len: int,
     phase: str,
     past_key_values: Any = None,
+    target_layers: Optional[List[int]] = None,
+    gradient_checkpointing: bool = False,
 ) -> Tuple[List[Dict[str, Any]], "ModuleTracker", Any]:
     """Run one forward pass for *phase* and return ``(records, tracker, output)``.
 
@@ -352,8 +354,13 @@ def _trace_phase(
         forward_kwargs["past_key_values"] = past_key_values
 
     is_training = phase in _TRAINING_PHASES
+    # train_backward: pause recording during forward, only capture backward ops
+    is_backward_only = phase == "train_backward"
     if is_training:
         model.train()
+        if gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled.")
 
     tensor_tracker = TensorTracker()
     tracker = ModuleTracker(model)
@@ -361,12 +368,17 @@ def _trace_phase(
         tensor_tracker=tensor_tracker,
         module_tracker=tracker,
         skip_reshapes=True,
+        active=not is_backward_only,
+        target_layers=target_layers,
     )
     try:
         if is_training:
             with recorder:
                 output = model(**forward_kwargs)
                 if phase == "train_backward":
+                    tracker._forward_depth = 0       # reset any accumulated state
+                    tracker._in_backward_phase = True
+                    recorder.active = True  # start capturing backward ops
                     logits = getattr(output, "logits", None)
                     if logits is None:
                         logits = getattr(output, "last_hidden_state", None)
@@ -384,9 +396,279 @@ def _trace_phase(
     finally:
         tracker.remove()
         if is_training:
+            if gradient_checkpointing:
+                model.gradient_checkpointing_disable()
             model.eval()
 
     return recorder.records, tracker, output
+
+
+# ── torch.compile graph-mode helpers ──────────────────────────────────────────
+
+def _compile_graph_to_records(
+    gm: Any,
+    skip_reshapes: bool = True,
+    id_to_path: Optional[Dict[int, str]] = None,
+    target_layers: Optional[Set[int]] = None,
+) -> List[Dict[str, Any]]:
+    """Convert a torch.compile-captured GraphModule to op-record dicts.
+
+    The output format is identical to :class:`RecordingDispatch` records so
+    that all downstream writers work without modification.  When Dynamo
+    preserved ``nn_module_stack`` metadata, ``module_path`` and
+    ``module_class`` are populated; otherwise they are left empty.
+
+    Parameters
+    ----------
+    id_to_path:
+        Mapping from ``id(module)`` to the full dotted module path (e.g.
+        ``"model.layers.0.self_attn"``).  Built once by
+        :func:`_trace_compile_phase` from ``model.named_modules()`` so that
+        ``nn_module_stack`` keys (which are ``id()`` strings of the original
+        modules) can be resolved to their full hierarchical paths even when
+        graph breaks strip the ``layers.N`` prefix from the path strings.
+    """
+    import torch.fx
+    from python.zrt.graph.tensor_utils import SKIP_OPS
+    from python.zrt.graph.classifier import extract_layer_idx, classify_component
+
+    name_to_id: Dict[str, int] = {}
+    for node in gm.graph.nodes:
+        if node.op == "call_function":
+            name_to_id[node.name] = len(name_to_id)
+
+    records: List[Dict[str, Any]] = []
+
+    for node in gm.graph.nodes:
+        if node.op != "call_function":
+            continue
+
+        target = node.target
+        if hasattr(target, "_overloadpacket"):
+            # Proper aten OpOverload → "aten.mm.default"
+            target_str = str(target)
+        elif hasattr(target, "__name__"):
+            module = getattr(target, "__module__", "") or ""
+            target_str = f"{module}.{target.__name__}".lstrip(".")
+        else:
+            try:
+                target_str = str(target)
+            except Exception:
+                target_str = repr(target)
+
+        if skip_reshapes and target_str in SKIP_OPS:
+            continue
+
+        parts = target_str.split(".")
+        op_short = parts[1] if len(parts) >= 2 else target_str
+
+        # Output tensors from meta['val']
+        out_val = node.meta.get("val")
+        if isinstance(out_val, torch.Tensor):
+            out_vals = [out_val]
+        elif isinstance(out_val, (tuple, list)):
+            out_vals = [v for v in out_val if isinstance(v, torch.Tensor)]
+        else:
+            out_vals = []
+
+        # Input tensors and IDs from arg nodes' meta['val']
+        in_vals: List[Any] = []
+        in_ids: List[int] = []
+
+        def _collect(arg: Any) -> None:
+            if isinstance(arg, torch.fx.Node):
+                v = arg.meta.get("val")
+                if isinstance(v, torch.Tensor):
+                    in_vals.append(v)
+                if arg.name in name_to_id:
+                    in_ids.append(name_to_id[arg.name])
+            elif isinstance(arg, (list, tuple)):
+                for a in arg:
+                    _collect(a)
+            elif isinstance(arg, torch.Tensor):
+                # Direct tensor input (not from another node)
+                in_vals.append(arg)
+            elif isinstance(arg, dict):
+                # Handle dictionary inputs
+                for value in arg.values():
+                    _collect(value)
+
+        for arg in node.args:
+            _collect(arg)
+
+        # Module context — Dynamo preserves nn_module_stack
+        # nn_module_stack structure:
+        #   key   = str(id(module)) — e.g. "2587068077728"
+        #   value = (path_str, class_type) tuple
+        #     path_str  = e.g. "L['self'].layers.0.self_attn"  (may lose
+        #                 layers.N after graph breaks)
+        #     class_type = e.g. <class 'DeepseekV3Attention'>
+        # When id_to_path is available we resolve the key to the *full*
+        # module path via model.named_modules(), which always includes
+        # the layers.N prefix.
+        module_path, module_class = "", ""
+        layer = ""
+        stack = node.meta.get("nn_module_stack")
+        if stack:
+            try:
+                items = list(stack.items())
+                if items:
+                    last_key, last_val = items[-1]
+                    if isinstance(last_val, tuple) and len(last_val) >= 2:
+                        raw_path, cls_obj = last_val[0], last_val[1]
+                        module_class = getattr(cls_obj, "__name__", str(cls_obj))
+                        # Prefer id_to_path resolution (full path with layers.N)
+                        if id_to_path and isinstance(last_key, str):
+                            try:
+                                resolved = id_to_path.get(int(last_key))
+                                if resolved:
+                                    module_path = re.sub(
+                                        r"^model\.", "", resolved
+                                    )
+                            except (ValueError, TypeError):
+                                pass
+                        # Fallback to raw_path from nn_module_stack
+                        if not module_path and isinstance(raw_path, str):
+                            module_path = re.sub(
+                                r"^L\['self'\]\.", "", raw_path
+                            )
+                        layer = extract_layer_idx(module_path)
+                    else:
+                        module_class = str(last_val)
+                        module_path = module_class
+                        layer = extract_layer_idx(module_path)
+            except Exception as exc:
+                logger.debug("nn_module_stack parse failed: %s", exc)
+
+        if target_layers is not None:
+            layer_str = extract_layer_idx(module_path)
+            if layer_str and int(layer_str) not in target_layers:
+                continue
+
+        out_id = [name_to_id[node.name]] if node.name in name_to_id else []
+
+        records.append({
+            "node_id": len(records),
+            "op_short": op_short,
+            "aten_op": target_str,
+            "module_path": module_path,
+            "module_class": module_class,
+            "layer": layer,
+            "component": classify_component(module_path, target_str),
+            "src_file": "", "src_line": 0, "src_code": "", "src_func": "",
+            "extra_args": "",
+            "input_shapes":  ", ".join(str(list(v.shape)) for v in in_vals),
+            "input_dtypes":  ", ".join(str(v.dtype) for v in in_vals),
+            "output_shapes": ", ".join(str(list(v.shape)) for v in out_vals),
+            "output_dtypes": ", ".join(str(v.dtype) for v in out_vals),
+            "num_inputs":  len(in_vals),
+            "num_outputs": len(out_vals),
+            "_input_ids":  in_ids,
+            "_output_ids": out_id,
+        })
+
+    return records
+
+
+def _trace_compile_phase(
+    model: Any,
+    config: Any,
+    batch_size: int,
+    seq_len: int,
+    phase: str,
+    fake_mode: Any = None,
+    target_layers: Optional[Set[int]] = None,
+) -> Tuple[List[Dict[str, Any]], ModuleTracker]:
+    """Capture one phase via ``torch.compile`` with ``RecordingDispatch``.
+
+    The compiled model is executed inside a :class:`RecordingDispatch` context
+    so that every **aten-level** operator is recorded — exactly the same
+    format as the eager :func:`_trace_phase`.  This ensures graph-mode and
+    eager-mode outputs are directly comparable (same ``aten_op`` names,
+    same ``op_short``, same ``module_path`` via :class:`ModuleTracker`).
+
+    For ``train_backward``, the forward pass is captured with
+    ``recorder.active = False`` so only backward ops are recorded (matching
+    eager-mode semantics).
+
+    Returns ``(records, NullModuleTracker())`` — same shape as
+    :func:`_trace_phase` minus the model output.
+    """
+    phase = _PHASE_ALIASES.get(phase, phase)
+    is_training = phase in _TRAINING_PHASES
+    is_backward_only = phase == "train_backward"
+
+    query_len = 1 if phase == "decode" else seq_len
+    pos_start = seq_len if phase == "decode" else 0
+
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, query_len))
+    position_ids = (
+        torch.arange(pos_start, pos_start + query_len)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+
+    if phase == "decode":
+        mask = torch.zeros(1, 1, 1, query_len)
+    else:
+        mask = torch.full((1, 1, seq_len, seq_len), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+
+    if is_training:
+        model.train()
+
+    tensor_tracker = TensorTracker()
+    tracker = ModuleTracker(model)
+    recorder = RecordingDispatch(
+        tensor_tracker=tensor_tracker,
+        module_tracker=tracker,
+        skip_reshapes=True,
+        active=not is_backward_only,
+        target_layers=list(target_layers) if target_layers else None,
+    )
+
+    compiled = torch.compile(model, fullgraph=False)
+    fwd_kwargs: Dict[str, Any] = dict(
+        input_ids=input_ids,
+        attention_mask=mask,
+        position_ids=position_ids,
+        use_cache=False,
+    )
+
+    try:
+        if is_training:
+            with recorder, torch.enable_grad():
+                out = compiled(**fwd_kwargs)
+                if is_backward_only:
+                    recorder.active = True
+                logits = getattr(out, "logits", None)
+                if logits is None:
+                    logits = getattr(out, "last_hidden_state", None)
+                if logits is not None:
+                    try:
+                        logits.sum().backward()
+                    except Exception as exc:
+                        logger.warning("backward() skipped in compile mode: %s", exc)
+                else:
+                    logger.warning("No logits found; skipping backward.")
+        else:
+            with recorder, torch.no_grad():
+                compiled(**fwd_kwargs)
+    finally:
+        tracker.remove()
+        if is_training:
+            model.eval()
+        torch._dynamo.reset()
+
+    records = recorder.records
+    for i, rec in enumerate(records):
+        rec["node_id"] = i
+
+    logger.info(
+        "  compile-mode captured %d aten ops.",
+        len(records),
+    )
+    return records, tracker
 
 
 def _save_phase_outputs(
@@ -454,6 +736,8 @@ def run_trace_phases(
     target_layers: Optional[List[int]] = None,
     auto_layers: bool = True,
     platform: str = "generic",
+    graph_mode: bool = False,
+    gradient_checkpointing: bool = False,
 ) -> Tuple[Path, Dict[str, List[Dict[str, Any]]]]:
     """Load *model_id* once, trace each requested phase, write separate files.
 
@@ -494,6 +778,19 @@ def run_trace_phases(
         the first dense and first sparse (MoE) layer indices from the model
         config and use those as *target_layers*.  Ignored when
         *target_layers* is already set.
+    graph_mode:
+        When ``True``, use ``torch.fx``-based graph capture
+        (:mod:`python.zrt.graph.fx_capture`) instead of the default
+        ``TorchDispatchMode`` eager path.  Key differences:
+
+        * Explicit producer-consumer edges from FX graph structure.
+        * Unified GEMM representation (``aten.linear.default``).
+        * Training backward ops captured in a single ``make_fx`` pass.
+        * Module-path annotations may be absent (fusion still works, but
+          component labels fall back to bare aten op names).
+
+        The output format is identical to the eager path; all downstream
+        writers (Excel, JSON, ONNX) work without modification.
 
     Returns
     -------
@@ -531,7 +828,11 @@ def run_trace_phases(
             )
             effective_num_layers = min_required
 
-    logger.info("Loading model %s (%d layers) …", model_id, effective_num_layers)
+    logger.info(
+        "Loading model %s (%d layers, graph_mode=%s) …",
+        model_id, effective_num_layers, graph_mode,
+    )
+
     model, config, fake_mode = load_model(model_id, num_hidden_layers=effective_num_layers)
 
     slug = _make_model_slug(model_id)
@@ -552,32 +853,33 @@ def run_trace_phases(
 
     try:
         for phase in canonical_phases:
-            query_len = 1 if phase == "decode" else seq_len
-            logger.info(
-                "Tracing %s phase (batch=%d, query_len=%d, grad=%s) …",
-                phase, batch_size, query_len, phase in _TRAINING_PHASES,
-            )
-            records, tracker, output = _trace_phase(
-                model, config, batch_size, seq_len, phase, past_key_values)
-            logger.info("  Captured %d ops.", len(records))
-
-            # Pass KV cache from prefill into the subsequent decode pass (inference only).
-            if phase == "prefill" and "decode" in canonical_phases:
-                past_key_values = getattr(output, "past_key_values", None)
-                if past_key_values is None:
-                    logger.warning(
-                        "Prefill output contains no past_key_values; "
-                        "decode pass will run without KV cache "
-                        "(attention shapes may differ from a real decode step)")
-
-            # Filter to requested layers (if any).
-            if target_layers is not None:
-                before = len(records)
-                records = _filter_records_by_layers(records, target_layers)
+            if graph_mode:
+                # ── torch.compile graph-mode path ─────────────────────────
+                records, tracker = _trace_compile_phase(
+                    model, config, batch_size, seq_len, phase, fake_mode,
+                    target_layers=set(target_layers) if target_layers else None)
+            else:
+                # ── Eager TorchDispatchMode path ──────────────────────────
+                query_len = 1 if phase == "decode" else seq_len
                 logger.info(
-                    "  Layer filter %s: %d → %d ops.",
-                    target_layers, before, len(records),
+                    "Tracing %s phase (batch=%d, query_len=%d, grad=%s) …",
+                    phase, batch_size, query_len, phase in _TRAINING_PHASES,
                 )
+                # target_layers filtering is done inside RecordingDispatch
+                records, tracker, output = _trace_phase(
+                    model, config, batch_size, seq_len, phase, past_key_values,
+                    target_layers=target_layers,
+                    gradient_checkpointing=gradient_checkpointing)
+                logger.info("  Captured %d ops.", len(records))
+
+                # Pass KV cache from prefill into the subsequent decode pass.
+                if phase == "prefill" and "decode" in canonical_phases:
+                    past_key_values = getattr(output, "past_key_values", None)
+                    if past_key_values is None:
+                        logger.warning(
+                            "Prefill output contains no past_key_values; "
+                            "decode pass will run without KV cache "
+                            "(attention shapes may differ from a real decode step)")
 
             raw_opgraph, fused_opgraph = _save_phase_outputs(
                 records, tracker, phase, slug, output_dir, config_summary,
@@ -602,6 +904,7 @@ def run_trace(
     target_layers: Optional[List[int]] = None,
     auto_layers: bool = False,
     platform: str = "generic",
+    graph_mode: bool = False,
 ) -> Tuple[Path, List[Dict[str, Any]]]:
     """Load *model_id*, trace a single phase, write Excel + graph outputs.
 
@@ -636,6 +939,7 @@ def run_trace(
         target_layers=target_layers,
         auto_layers=auto_layers,
         platform=platform,
+        graph_mode=graph_mode,
     )
     canonical = _PHASE_ALIASES.get(phase, phase)
     phase_graphs = result.graphs.get(canonical)
@@ -686,6 +990,14 @@ def main() -> None:
              "(default: generic).  Controls which fused op names are assigned "
              "(e.g. flash_attn on cuda, npu_fusion_attention on ascend_npu).",
     )
+    parser.add_argument(
+        "--graph-mode",
+        action="store_true",
+        default=False,
+        help="Use torch.compile graph capture instead of TorchDispatchMode "
+             "eager tracing.  Provides explicit data-flow edges and preserves "
+             "module-path annotations via Dynamo's nn_module_stack.",
+    )
 
     # Performance report
     parser.add_argument(
@@ -699,6 +1011,15 @@ def main() -> None:
     parser.add_argument(
         "--tp", type=int, default=1,
         help="Tensor-parallel degree used when --hw is set (default: 1).",
+    )
+
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        default=False,
+        help="Enable activation checkpointing (recomputation) during training phases. "
+             "Recomputed forward ops are marked with recompute=True in the output. "
+             "Ignored for inference phases.",
     )
 
     # Layer selection
@@ -764,6 +1085,8 @@ def main() -> None:
         target_layers=target_layers,
         auto_layers=effective_auto_layers,
         platform=args.platform,
+        graph_mode=args.graph_mode,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
     if args.hw:

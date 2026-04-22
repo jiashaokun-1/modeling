@@ -178,9 +178,36 @@ _GATE_RE    = r".*Gate.*|.*Router.*|.*MoEGate.*|.*MoeGate.*|.*TopkRouter.*"
 _MLP_RE     = r".*MLP.*|.*FFN.*|.*FeedForward.*"
 _MOE_RE     = r".*MoE.*|.*SparseMoe.*|.*Expert.*"
 _NORM_RE    = r".*RMSNorm.*|.*LayerNorm.*|.*RmsNorm.*"
+_EMBED_RE   = r".*Embed.*"
 
 # ── CUDA patterns (H100 / A100 / A10 family) ─────────────────────────────────
 _CUDA_PATTERNS: List[SubPattern] = [
+    # ── Backward patterns (priority 50+) ─────────────────────────────────────
+    # SDPA backward (single composite op)
+    SubPattern("sdpa_backward", _ATTN_RE,
+               [r"scaled_dot_product_attention_backward"],
+               priority=50),
+    # Attention backward: dQ/dK/dV via mm + softmax_backward + mm
+    SubPattern("attn_grad", _ATTN_RE,
+               [r"\b(mm|bmm|matmul)\b", r"_softmax_backward_data", r"\b(mm|bmm|matmul)\b"],
+               priority=42),
+    # Native norm backward (fused kernel: LayerNorm / GroupNorm)
+    SubPattern("norm_backward", _NORM_RE,
+               [r"native_layer_norm_backward|native_group_norm_backward"],
+               priority=38),
+    # Embedding backward
+    SubPattern("embedding_backward", _EMBED_RE,
+               [r"embedding_dense_backward"],
+               priority=35),
+    # Gated MLP backward (SwiGLU / GeGLU): silu/gelu_backward → mul → mm
+    SubPattern("gated_mlp_backward", _MLP_RE,
+               [r"silu_backward|gelu_backward", r"\bmul\b", r"\bmm\b"],
+               priority=28),
+    # Dense MLP backward: activation_backward → mm
+    SubPattern("mlp_backward", _MLP_RE,
+               [r"threshold_backward|silu_backward|gelu_backward", r"\bmm\b"],
+               priority=24),
+    # ── Forward patterns ─────────────────────────────────────────────────────
     # FlashAttention: QK matmul → softmax → AV matmul (inside Attention module)
     SubPattern("flash_attn", _ATTN_RE,
                [r"\b(mm|bmm|matmul)\b", r"softmax", r"\b(mm|bmm|matmul)\b"],
@@ -209,8 +236,27 @@ _CUDA_PATTERNS: List[SubPattern] = [
 
 # ── Ascend NPU / CANN patterns ────────────────────────────────────────────────
 _ASCEND_PATTERNS: List[SubPattern] = [
+    # ── Backward patterns ─────────────────────────────────────────────────────
+    SubPattern("sdpa_backward", _ATTN_RE,
+               [r"scaled_dot_product_attention_backward"],
+               priority=55),
+    SubPattern("attn_grad", _ATTN_RE,
+               [r"\b(mm|bmm|matmul)\b", r"_softmax_backward_data", r"\b(mm|bmm|matmul)\b"],
+               priority=45),
+    SubPattern("norm_backward", _NORM_RE,
+               [r"native_layer_norm_backward|native_group_norm_backward"],
+               priority=42),
+    SubPattern("embedding_backward", _EMBED_RE,
+               [r"embedding_dense_backward"],
+               priority=38),
+    SubPattern("gated_mlp_backward", _MLP_RE,
+               [r"silu_backward|gelu_backward", r"\bmul\b", r"\bmm\b"],
+               priority=32),
+    SubPattern("mlp_backward", _MLP_RE,
+               [r"threshold_backward|silu_backward|gelu_backward", r"\bmm\b"],
+               priority=28),
+    # ── Forward patterns ─────────────────────────────────────────────────────
     # AddRMSNorm: residual add fused into norm (cross-boundary, see fusion.py)
-    # Listed here so the pattern engine can also detect it within a group
     SubPattern("npu_add_rms_norm", _NORM_RE,
                [r"\badd\b", r"pow|mean|rsqrt|mul"],
                priority=50),
@@ -236,6 +282,23 @@ _ASCEND_PATTERNS: List[SubPattern] = [
 
 # ── CPU patterns ──────────────────────────────────────────────────────────────
 _CPU_PATTERNS: List[SubPattern] = [
+    # ── Backward patterns ─────────────────────────────────────────────────────
+    SubPattern("sdpa_backward", _ATTN_RE,
+               [r"scaled_dot_product_attention_backward"],
+               priority=50),
+    SubPattern("norm_backward", _NORM_RE,
+               [r"native_layer_norm_backward|native_group_norm_backward"],
+               priority=38),
+    SubPattern("embedding_backward", _EMBED_RE,
+               [r"embedding_dense_backward"],
+               priority=35),
+    SubPattern("gated_mlp_backward", _MLP_RE,
+               [r"silu_backward|gelu_backward", r"\bmul\b", r"\bmm\b"],
+               priority=28),
+    SubPattern("mlp_backward", _MLP_RE,
+               [r"threshold_backward|silu_backward|gelu_backward", r"\bmm\b"],
+               priority=24),
+    # ── Forward patterns ─────────────────────────────────────────────────────
     SubPattern("sdpa", _ATTN_RE,
                [r"scaled_dot_product_attention"],
                priority=25),

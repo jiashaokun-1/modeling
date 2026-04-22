@@ -23,17 +23,13 @@ def test_train_alias_equals_train_forward():
     assert ops_alias == ops_full
 
 
-def test_train_backward_has_more_ops_than_forward():
-    """Backward pass appends gradient ops on top of the forward sequence."""
+def test_train_backward_has_ops():
+    """Backward phase captures gradient ops (only backward ops, not forward ops)."""
     _, phase_records = run_trace_phases(
         **_COMMON, phases=("train_forward", "train_backward")
     )
-    fwd = phase_records["train_forward"]
     bwd = phase_records["train_backward"]
-    assert len(bwd) > len(fwd), (
-        f"Expected backward to record more ops than forward "
-        f"({len(bwd)} vs {len(fwd)})"
-    )
+    assert len(bwd) > 0, "train_backward phase produced no records"
 
 
 def test_train_and_inference_phases_coexist():

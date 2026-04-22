@@ -308,11 +308,14 @@ class FusionPass(GraphPass):
             label     = _semantic_label(group, path_to_class, platform)
 
             if len(group) == 1:
-                # Single-node: only relabel op_type if semantic label differs
+                # Single-node: only relabel op_type if semantic label differs.
+                # Preserve the original aten op in fused_from so that
+                # _fused_decompose can still look up the correct formula.
                 node = group[0]
                 if label != node.op_type and node.module_class:
+                    original_op       = node.op_type
                     node.op_type      = label
-                    node.fused_from   = [node.op_type]
+                    node.fused_from   = [original_op]
                     node.num_sub_ops  = 1
                     node.fusion_level = "leaf"
                 continue

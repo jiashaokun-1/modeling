@@ -578,25 +578,19 @@ def _trace_compile_phase(
     phase: str,
     fake_mode: Any = None,
     target_layers: Optional[Set[int]] = None,
-) -> Tuple[List[Dict[str, Any]], ModuleTracker]:
-    """Capture one phase via ``torch.compile`` with ``RecordingDispatch``.
+) -> Tuple[List[Dict[str, Any]], NullModuleTracker]:
+    """Capture one phase via ``torch.compile`` with a graph-capturing backend.
 
-    The compiled model is executed inside a :class:`RecordingDispatch` context
-    so that every **aten-level** operator is recorded — exactly the same
-    format as the eager :func:`_trace_phase`.  This ensures graph-mode and
-    eager-mode outputs are directly comparable (same ``aten_op`` names,
-    same ``op_short``, same ``module_path`` via :class:`ModuleTracker`).
-
-    For ``train_backward``, the forward pass is captured with
-    ``recorder.active = False`` so only backward ops are recorded (matching
-    eager-mode semantics).
+    A custom backend collects every ``GraphModule`` that Dynamo produces
+    (there may be multiple due to graph breaks).  For ``train_backward``,
+    ``loss.backward()`` is called inside the same compile context so gradient
+    subgraphs are captured as well.
 
     Returns ``(records, NullModuleTracker())`` — same shape as
     :func:`_trace_phase` minus the model output.
     """
     phase = _PHASE_ALIASES.get(phase, phase)
     is_training = phase in _TRAINING_PHASES
-    is_backward_only = phase == "train_backward"
 
     query_len = 1 if phase == "decode" else seq_len
     pos_start = seq_len if phase == "decode" else 0
@@ -614,20 +608,35 @@ def _trace_compile_phase(
         mask = torch.full((1, 1, seq_len, seq_len), float("-inf"))
         mask = torch.triu(mask, diagonal=1)
 
+    captured: List[Any] = []
+
+    _fm = fake_mode
+    if _fm is not None and not getattr(_fm, "allow_non_fake_inputs", False):
+        from torch._subclasses.fake_tensor import FakeTensorMode as _FTM
+        _fm = _FTM(allow_non_fake_inputs=True)
+
+    class _ValCapture(torch.fx.Interpreter):
+        def run_node(self, node: Any) -> Any:
+            if _fm is not None:
+                with _fm:
+                    result = super().run_node(node)
+            else:
+                result = super().run_node(node)
+            node.meta["val"] = result
+            return result
+
+    def _backend(gm: Any, example_inputs: Any) -> Any:
+        try:
+            _ValCapture(gm).run(*example_inputs)
+        except Exception as exc:
+            logger.debug("Shape propagation failed for captured subgraph: %s", exc)
+        captured.append(gm)
+        return gm.forward
+
     if is_training:
         model.train()
 
-    tensor_tracker = TensorTracker()
-    tracker = ModuleTracker(model)
-    recorder = RecordingDispatch(
-        tensor_tracker=tensor_tracker,
-        module_tracker=tracker,
-        skip_reshapes=True,
-        active=not is_backward_only,
-        target_layers=list(target_layers) if target_layers else None,
-    )
-
-    compiled = torch.compile(model, fullgraph=False)
+    compiled = torch.compile(model, backend=_backend, fullgraph=False)
     fwd_kwargs: Dict[str, Any] = dict(
         input_ids=input_ids,
         attention_mask=mask,
@@ -637,38 +646,43 @@ def _trace_compile_phase(
 
     try:
         if is_training:
-            with recorder, torch.enable_grad():
+            with torch.enable_grad():
                 out = compiled(**fwd_kwargs)
-                if is_backward_only:
-                    recorder.active = True
-                logits = getattr(out, "logits", None)
-                if logits is None:
-                    logits = getattr(out, "last_hidden_state", None)
-                if logits is not None:
-                    try:
-                        logits.sum().backward()
-                    except Exception as exc:
-                        logger.warning("backward() skipped in compile mode: %s", exc)
-                else:
-                    logger.warning("No logits found; skipping backward.")
+                if phase == "train_backward":
+                    logits = getattr(out, "logits", None)
+                    if logits is None:
+                        logits = getattr(out, "last_hidden_state", None)
+                    if logits is not None:
+                        try:
+                            logits.sum().backward()
+                        except Exception as exc:
+                            logger.warning("backward() skipped in compile mode: %s", exc)
+                    else:
+                        logger.warning("No logits found; skipping backward.")
         else:
-            with recorder, torch.no_grad():
+            with torch.no_grad():
                 compiled(**fwd_kwargs)
     finally:
-        tracker.remove()
         if is_training:
             model.eval()
         torch._dynamo.reset()
 
-    records = recorder.records
-    for i, rec in enumerate(records):
+    id_to_path: Dict[int, str] = {
+        id(mod): name for name, mod in model.named_modules()
+    }
+
+    all_records: List[Dict[str, Any]] = []
+    for gm in captured:
+        all_records.extend(_compile_graph_to_records(gm, id_to_path=id_to_path,
+                                                     target_layers=target_layers))
+    for i, rec in enumerate(all_records):
         rec["node_id"] = i
 
     logger.info(
-        "  compile-mode captured %d aten ops.",
-        len(records),
+        "  compile-mode captured %d ops from %d subgraph(s).",
+        len(all_records), len(captured),
     )
-    return records, tracker
+    return all_records, NullModuleTracker()
 
 
 def _save_phase_outputs(

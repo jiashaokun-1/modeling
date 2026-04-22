@@ -1,41 +1,121 @@
 """Roofline model simulator — universal fallback backend.
 
-Formulas
+Latency model
+-------------
+    latency = max(FLOPs / peak_flops,  bytes / hbm_bandwidth,  1e-3 µs)
+
+The bound column in SimResult tells you which term dominates.
+
+算子全景计算公式
+================
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 分类           │ 代表算子 / op_type                     │ FLOPs 公式                            │
+│                │                                        │ 读带宽 (R) / 写带宽 (W)               │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 矩阵乘 (GEMM)                                                                                   │
+│   mm           │ aten.mm / aten.matmul                  │ 2·M·K·N                               │
+│                │                                        │ R=(M·K+K·N)·b  W=M·N·b               │
+│   addmm        │ aten.addmm                             │ 2·M·K·N + M·N  (mm + bias add)        │
+│                │                                        │ R=(M·K+K·N+|bias|)·b  W=M·N·b        │
+│   bmm          │ aten.bmm                               │ 2·B·M·K·N                             │
+│                │                                        │ R=(B·M·K+B·K·N)·b  W=B·M·N·b         │
+│   linear       │ aten.linear                            │ 2·batch·I·O [+ batch·O if bias]       │
+│                │ (input=(*,I), weight=(O,I))             │ R=(batch·I+O·I)·b  W=batch·O·b        │
+│   Linear       │ FusionPass 融合的 nn.Linear            │ 2·batch·I·N [+ batch·N if bias]       │
+│   lm_head      │ (input=(*,I), weight=(I,N) transposed) │ R=(batch·I+I·N)·b  W=batch·N·b        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 注意力 (Attention)                                                                              │
+│   sdpa         │ aten.scaled_dot_product_attention       │ 4·N·H·Sq·Sk·D + 5·N·H·Sq·Sk          │
+│   flash_attn   │ aten._scaled_dot_product_flash_attn    │   (QK matmul + AV matmul + softmax)   │
+│   mla_attn     │ flash_attn / sdpa / mla_attn           │ R=(Q+K+V)·b  W=output·b               │
+│   sdpa_backward│ attn_grad                              │ 同上 (backward 代入 grad shape)        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 归一化 (Norm)                                                                                   │
+│   rms_norm     │ rms_norm                               │ 4·N  (sq+mean+rsqrt+scale)            │
+│                │                                        │ R=(N+|weight|)·b  W=N·b               │
+│   layer_norm   │ aten.layer_norm / layer_norm           │ 5·N  (mean+var+norm+scale+shift)       │
+│                │                                        │ R=(N+2·|weight|)·b  W=N·b             │
+│   add_rms_norm │ add_rms_norm / add_layer_norm          │ 6·N  (norm×5 + residual add)           │
+│   npu_add_rms  │ npu_add_rms_norm                       │ R=(2·N+|weight|)·b  W=N·b             │
+│   norm_backward│ norm_backward                          │ 同 add_rms_norm                        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Softmax                                                                                         │
+│                │ aten._softmax / aten.softmax.int        │ 5·N  (max+sub+exp+sum+div)            │
+│                │                                        │ R=N·b  W=N·b                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 逐元素 — 1 op/elem                                                                              │
+│                │ add / sub / rsub / mul / div / neg /   │ 1·N                                   │
+│                │ abs / relu / tanh / exp / log /        │ R=sum(|inputs|)·b                     │
+│                │ sqrt / rsqrt / pow / masked_fill        │ W=|output|·b                          │
+│                │ mean / sum / amax / amin (reduction)    │                                       │
+│                │ copy_                                   │ 0 FLOPs, R=input·b, W=output·b        │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 逐元素 — 2 ops/elem                                                                             │
+│                │ reciprocal / clamp / clamp_min/max     │ 2·N                                   │
+│                │ var (reduce: sq+mean+sub+sq+mean ≈ 3N) │ 3·N                                   │
+│                │ rope (cos*x + sin*x_rot)               │ 2·N                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 激活 — 4 ops/elem                                                                               │
+│                │ silu (x·σ(x), σ≈4 ops)                │ 4·N                                   │
+│                │ gelu  (~x·Φ(x), ≈4 ops)               │ 4·N                                   │
+│                │ sigmoid (1/(1+e^-x))                   │ 4·N                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 超越函数 — 10 ops/elem (CORDIC / polynomial)                                                   │
+│                │ sin / cos / atan2  (用于 RoPE)          │ 10·N                                  │
+│                │                                        │ R=input·b  W=output·b                 │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ MLP / 专家层 (MLP / MoE expert)                                                                 │
+│   gated_mlp    │ gated_mlp / mlp                        │ Σ 2·batch·H·Oᵢ + 4·N_act/2           │
+│   moe_block    │ gated_mlp_backward / mlp_backward      │   (按权重矩阵累加 GEMM FLOPs          │
+│   moe_expert   │ moe_expert / moe_shared / moe_block    │    + gated activation 代价)           │
+│                │                                        │ R=hidden+Σweights  W=output           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ MoE 路由 (MoE gate / router)                                                                   │
+│   moe_gate     │ moe_gate / npu_moe_gate                │ linear FLOPs + 5·N (softmax)          │
+│   moe_gate_topk│ moe_gate_topk / npu_moe_gate_topk      │   + N (topk, if with_topk=True)       │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ MoE Dispatch (scatter / gather 路由)                                                            │
+│   moe_dispatch │ moe_dispatch / npu_moe_dispatch         │ 0 FLOPs (索引操作)                   │
+│                │ aten.index / gather / scatter           │ R=sum(inputs)·b  W=|output|·b         │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Embedding / 查表                                                                                │
+│   embedding    │ aten.embedding / embedding              │ 0 FLOPs (随机 HBM 读取)              │
+│   embedding_bwd│ embedding_backward                     │ R=|output|·b  W=|output|·b            │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Dtype 转换                                                                                      │
+│                │ aten._to_copy (cast / device copy)     │ 0 FLOPs                               │
+│                │                                        │ R=|input|·b_in  W=|output|·b_out      │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 分配 / 填充 (write-only)                                                                        │
+│                │ new_empty / new_empty_strided           │ 0 FLOPs, R=0                          │
+│                │ fill_ / zero_                          │ W=|output|·b                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Shape / View (透明算子)                                                                         │
+│                │ view / reshape / expand / squeeze /    │ ≈ 0 FLOPs                             │
+│                │ permute / transpose / contiguous /     │ R≈|output|·b  W≈|output|·b            │
+│                │ flatten / select / slice / cat / stack │ (视内存是否连续, 实际可能为0)           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 兜底 (fallback)                                                                                 │
+│                │ 任意未覆盖算子                          │ 1·N_out (保守估计)                    │
+│                │                                        │ R=total_input_bytes  W=total_output   │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+符号说明
 --------
-matmul (mm / bmm / addmm / linear):
-    FLOPs  = 2 * M * N * K
-    read   = (M*K + K*N) * itemsize
-    write  = M*N * itemsize
+  N         = numel(tensor)  元素总数
+  b / b_in / b_out = dtype.itemsize  字节宽度 (bf16=2, fp32=4, ...)
+  batch     = numel(input.shape[:-1])  最后一维以外的所有维度乘积
+  M,K,N     = 矩阵维度 (rows, common, cols)
+  B,H,Sq,Sk,D = attention 批次/头数/Query长/Key长/头维度
+  H,I       = MLP hidden_size / intermediate_size
+  Oᵢ        = 第 i 个权重矩阵的输出维度
 
-flash-attention / SDPA:
-    FLOPs  ≈ 4 * B * H * Sq * Sk * D   (QK + AV matmuls, ignoring softmax)
-    read   = (Q + K + V) bytes
-    write  = output bytes
-
-layer_norm / rms_norm:
-    FLOPs  ≈ 5 * numel(input)
-    read   = numel(input + weight + bias) * itemsize
-    write  = numel(output) * itemsize
-
-softmax:
-    FLOPs  ≈ 5 * numel(input)
-    read   = numel(input) * itemsize
-    write  = numel(output) * itemsize
-
-elementwise (add, mul, silu, gelu, ...):
-    FLOPs  = ops_per_elem * numel(output)
-    read   = sum(numel(input_i)) * itemsize
-    write  = numel(output) * itemsize
-
-embedding:
-    FLOPs  = 0
-    read   = numel(output) * itemsize   (cache-miss dominated)
-    write  = numel(output) * itemsize
-
-default fallback:
-    FLOPs  = numel(output)  (1 op / element, conservative)
-    read   = total_input_bytes
-    write  = total_output_bytes
+分类覆盖说明
+------------
+  _EXACT_FORMULAS  精确匹配表覆盖 ~108 个 op_type 字符串 (aten 原始算子 + FusionPass 语义标签)
+  _fused_decompose 对 is_fused=True 且无精确匹配的节点按 fused_from 子算子累加 FLOPs
+  _SHAPE_OP_PREFIXES 前缀表, 透明算子跳过 FLOPs 计算
 """
 from __future__ import annotations
 
@@ -82,7 +162,9 @@ FMR = tuple[float, float, float]   # (flops, read_bytes, write_bytes)
 
 
 def _mm(node: "OpNode") -> FMR:
-    """aten.mm.default: A=(M,K) @ B=(K,N) → (M,N)"""
+    """aten.mm.default: A=(M,K) @ B=(K,N) → (M,N)
+    FLOPs = 2·M·K·N   R=(M·K+K·N)·b   W=M·N·b
+    """
     if len(node.inputs) < 2:
         return _default(node)
     a, b = node.inputs[0], node.inputs[1]
@@ -98,7 +180,9 @@ def _mm(node: "OpNode") -> FMR:
 
 
 def _addmm(node: "OpNode") -> FMR:
-    """aten.addmm.default: bias + mat1 @ mat2"""
+    """aten.addmm.default: bias + mat1=(M,K) @ mat2=(K,N) → (M,N)
+    FLOPs = 2·M·K·N + M·N   R=(M·K+K·N+|bias|)·b   W=M·N·b
+    """
     if len(node.inputs) < 3:
         return _default(node)
     # inputs: [bias, mat1, mat2]
@@ -116,7 +200,9 @@ def _addmm(node: "OpNode") -> FMR:
 
 
 def _bmm(node: "OpNode") -> FMR:
-    """aten.bmm.default: (B,M,K) @ (B,K,N) → (B,M,N)"""
+    """aten.bmm.default: (B,M,K) @ (B,K,N) → (B,M,N)
+    FLOPs = 2·B·M·K·N   R=(B·M·K+B·K·N)·b   W=B·M·N·b
+    """
     if len(node.inputs) < 2:
         return _default(node)
     a, b = node.inputs[0], node.inputs[1]
@@ -132,7 +218,10 @@ def _bmm(node: "OpNode") -> FMR:
 
 
 def _linear(node: "OpNode") -> FMR:
-    """aten.linear.default: input=(*,I), weight=(O,I), optional bias=(O,)"""
+    """aten.linear.default: input=(*,I), weight=(O,I), optional bias=(O,)
+    FLOPs = 2·batch·I·O [+ batch·O if bias]
+    R=(batch·I + O·I [+ O])·b   W=batch·O·b
+    """
     if len(node.inputs) < 2:
         return _default(node)
     inp, weight = node.inputs[0], node.inputs[1]
@@ -155,9 +244,10 @@ def _linear(node: "OpNode") -> FMR:
 def _scaled_dot_product_attention(node: "OpNode") -> FMR:
     """aten._scaled_dot_product_flash_attention / scaled_dot_product_attention.
 
-    Query shape: (N, H, Sq, D)  or  (N, Sq, H, D)
-    Key   shape: (N, H, Sk, D)  or  (N, Sk, H, D)
-    Value shape: (N, H, Sk, Dv) or  (N, Sk, H, Dv)
+    Input layout assumed: Q=(N,H,Sq,D), K=(N,H,Sk,D), V=(N,H,Sk,Dv)
+    FLOPs = 4·N·H·Sq·Sk·D        (QK + AV matmuls)
+          + 5·N·H·Sq·Sk           (softmax: max+sub+exp+sum+div)
+    R = (Q+K+V)·b    W = output·b
     """
     if len(node.inputs) < 3:
         return _default(node)
@@ -178,7 +268,10 @@ def _scaled_dot_product_attention(node: "OpNode") -> FMR:
 
 
 def _layer_norm(node: "OpNode") -> FMR:
-    """aten.layer_norm.default / aten.native_layer_norm.default"""
+    """aten.layer_norm.default / aten.native_layer_norm.default
+    FLOPs ≈ 5·N  (mean + variance + normalize + scale + shift)
+    R=(N + 2·|weight|)·b    W=N·b
+    """
     if not node.inputs:
         return _default(node)
     inp = node.inputs[0]
@@ -194,7 +287,10 @@ def _layer_norm(node: "OpNode") -> FMR:
 
 
 def _rms_norm(node: "OpNode") -> FMR:
-    """Fused rms_norm: fewer ops than layer_norm (no mean subtraction)."""
+    """Fused rms_norm: fewer ops than layer_norm (no mean subtraction).
+    FLOPs ≈ 4·N  (pow + mean + rsqrt + mul + scale)
+    R=(N + |weight|)·b    W=N·b
+    """
     if not node.inputs:
         return _default(node)
     inp = node.inputs[0]
@@ -209,7 +305,10 @@ def _rms_norm(node: "OpNode") -> FMR:
 
 
 def _softmax(node: "OpNode") -> FMR:
-    """aten._softmax.default / aten.softmax.int"""
+    """aten._softmax.default / aten.softmax.int
+    FLOPs ≈ 5·N  (max + sub + exp + sum + div)
+    R=N·b    W=N·b
+    """
     if not node.inputs:
         return _default(node)
     inp = node.inputs[0]
@@ -223,7 +322,17 @@ def _softmax(node: "OpNode") -> FMR:
 
 
 def _elementwise(node: "OpNode", ops_per_elem: float = 1.0) -> FMR:
-    """Generic elementwise op: one (or a few) ops per output element."""
+    """Generic elementwise op.
+    FLOPs = ops_per_elem · N_out
+    R=sum(|inputs|)·b    W=|output|·b
+
+    ops_per_elem 取值参考:
+      1.0  — add/sub/mul/div/neg/abs/relu/exp/log/sqrt/rsqrt/pow/masked_fill/reduction
+      2.0  — reciprocal/clamp/rope  (比较 + 赋值)
+      3.0  — var  (sq+mean+sub+sq+mean ≈ 3步)
+      4.0  — silu/gelu/sigmoid  (含指数/多项式近似)
+      10.0 — sin/cos/atan2  (CORDIC / 多项式展开)
+    """
     if not node.outputs:
         return _default(node)
     out = node.outputs[0]
@@ -236,7 +345,10 @@ def _elementwise(node: "OpNode", ops_per_elem: float = 1.0) -> FMR:
 
 
 def _embedding(node: "OpNode") -> FMR:
-    """aten.embedding.default: random HBM reads, negligible FLOPs."""
+    """aten.embedding.default / embedding / embedding_backward
+    FLOPs = 0  (纯查表, 无算术运算)
+    R=|output|·b   W=|output|·b   (cache-miss dominated random reads)
+    """
     if not node.outputs:
         return _default(node)
     out = node.outputs[0]
@@ -248,8 +360,76 @@ def _embedding(node: "OpNode") -> FMR:
     return flops, read, write
 
 
+def _dtype_cast(node: "OpNode") -> FMR:
+    """aten._to_copy.default: dtype cast / device copy.
+    FLOPs = 0  (无算术运算, 纯数据搬运)
+    R=|input|·b_in    W=|output|·b_out   (src/dst 字节宽可能不同, 如 bf16→fp32)
+    """
+    if node.inputs and node.outputs:
+        inp = node.inputs[0]
+        out = node.outputs[0]
+        read  = _numel(inp.shape) * inp.dtype.itemsize
+        write = _numel(out.shape) * out.dtype.itemsize
+    else:
+        read  = float(node.total_input_bytes())
+        write = float(node.total_output_bytes())
+    return 0.0, read, write
+
+
+def _gather(node: "OpNode") -> FMR:
+    """aten.index.Tensor / index_select / gather / scatter / scatter_add
+       moe_dispatch / npu_moe_dispatch
+    FLOPs = 0  (索引/路由操作, 无算术)
+    R=sum(|inputs|)·b    W=|output|·b
+    """
+    if not node.outputs:
+        return _default(node)
+    out = node.outputs[0]
+    n = _numel(out.shape)
+    it = out.dtype.itemsize
+    read  = float(node.total_input_bytes())
+    write = n * it
+    return 0.0, read, write
+
+
+def _linear_proj(node: "OpNode") -> FMR:
+    """Fused Linear projection: input(*,I) @ weight(I,O) → (*,O).
+
+    Used for op_type='Linear' nodes produced by FusionPass when a single
+    nn.Linear module's ops (view + mm + view) are grouped together.
+    Weight is stored in (I, O) layout after transpose in aten.mm.
+    """
+    if len(node.inputs) < 2:
+        return _default(node)
+    inp, weight = node.inputs[0], node.inputs[1]
+    if len(inp.shape) < 1 or len(weight.shape) < 2:
+        return _default(node)
+    I     = inp.shape[-1]
+    N     = weight.shape[-1]        # weight layout: (I, N) after mm's transpose
+    batch = _numel(inp.shape[:-1])  # product of all dims except last
+    it    = inp.dtype.itemsize
+    flops = 2.0 * batch * I * N
+    read  = (batch * I + I * N) * it
+    write = batch * N * it
+    if len(node.inputs) >= 3:       # optional bias
+        bias   = node.inputs[2]
+        flops += batch * N
+        read  += _numel(bias.shape) * bias.dtype.itemsize
+    return flops, read, write
+
+
+def _write_only(node: "OpNode") -> FMR:
+    """Allocation / fill ops: new_empty / new_empty_strided / fill_ / zero_
+    FLOPs = 0    R=0    W=|output|·b
+    """
+    return 0.0, 0.0, float(node.total_output_bytes())
+
+
 def _default(node: "OpNode") -> FMR:
-    """Conservative fallback: 1 flop / output element."""
+    """Conservative fallback for unrecognized ops.
+    FLOPs = N_out  (1 flop / output element)
+    R=total_input_bytes    W=total_output_bytes
+    """
     n_out = sum(_numel(o.shape) for o in node.outputs) if node.outputs else 1
     it = _itemsize(node)
     flops = float(n_out)
@@ -261,10 +441,10 @@ def _default(node: "OpNode") -> FMR:
 # ── fused op formulas ─────────────────────────────────────────────────────────
 
 def _fused_attention(node: "OpNode") -> FMR:
-    """flash_attn / sdpa / npu_fusion_attention / attn / mla_attn.
-
-    Assumes external inputs are ordered: [Q, K, V, ...].
-    Falls back to default if shapes are insufficient.
+    """flash_attn / sdpa / sdpa_backward / npu_fusion_attention / attn / attn_grad / mla_attn
+    外部输入按 [Q, K, V, ...] 顺序, 调用 _scaled_dot_product_attention.
+    FLOPs = 4·N·H·Sq·Sk·D + 5·N·H·Sq·Sk
+    R=(Q+K+V)·b    W=output·b
     """
     if len(node.inputs) >= 3:
         return _scaled_dot_product_attention(node)
@@ -273,7 +453,10 @@ def _fused_attention(node: "OpNode") -> FMR:
 
 
 def _fused_norm(node: "OpNode") -> FMR:
-    """rms_norm / layer_norm / add_rms_norm / add_layer_norm."""
+    """add_rms_norm / add_layer_norm / npu_add_rms_norm / norm_backward
+    在 rms_norm(5N) 基础上加 residual add(1N), 共 6N FLOPs.
+    FLOPs = 6·N    R=(2·N + |weight|)·b  (input + residual + weight)    W=N·b
+    """
     if not node.inputs:
         return _default(node)
     # For add_norm variants: FLOPs = 4-5 * N + N (for the add)
@@ -288,11 +471,11 @@ def _fused_norm(node: "OpNode") -> FMR:
 
 
 def _fused_mlp(node: "OpNode") -> FMR:
-    """gated_mlp / mlp: contains 2-3 matmuls + activation.
-
-    Inputs are typically: [hidden=(B,S,H), gate_w=(I,H), up_w=(I,H), down_w=(H,I)]
-    Where I = intermediate_size, H = hidden_size.
-    We estimate from available weight shapes.
+    """gated_mlp / mlp / gated_mlp_backward / mlp_backward
+       moe_block / moe_expert / moe_shared
+    输入典型布局: [hidden=(B,S,H), gate_w=(I,H), up_w=(I,H), down_w=(H,I)]
+    FLOPs = Σᵢ 2·batch·H·Oᵢ  +  4·N_act/2   (各 GEMM FLOPs + gated activation)
+    R = hidden·b + Σ|weight_i|·b    W = output·b
     """
     if len(node.inputs) < 2:
         return _default(node)
@@ -340,7 +523,11 @@ def _fused_mlp(node: "OpNode") -> FMR:
 
 
 def _fused_moe_gate(node: "OpNode", with_topk: bool = False) -> FMR:
-    """moe_gate / moe_gate_topk: small matmul + softmax (+ topk)."""
+    """moe_gate / npu_moe_gate / moe_gate_topk / npu_moe_gate_topk
+    一个小 GEMM (hidden→num_experts) + softmax (+ topk 比较)
+    FLOPs = linear_FLOPs + 5·N_out [+ N_out if with_topk]
+    R/W   = same as _linear for the gate matmul
+    """
     # Dominant cost: one matmul to compute gate scores
     if len(node.inputs) >= 2:
         flops, read, write = _linear(node) if len(node.inputs[1].shape) >= 2 else _default(node)
@@ -359,31 +546,37 @@ def _fused_moe_gate(node: "OpNode", with_topk: bool = False) -> FMR:
 # Check is "op_type starts with <key>" for prefix entries.
 
 _EXACT_FORMULAS: dict[str, "callable"] = {
-    # matmul
+    # ── matmul family ─────────────────────────────────────────────────────────
     "aten.mm.default":                  _mm,
     "aten.mm":                          _mm,
     "aten.addmm.default":               _addmm,
     "aten.addmm":                       _addmm,
     "aten.bmm.default":                 _bmm,
     "aten.bmm":                         _bmm,
+    "aten.matmul.default":              _mm,
+    "aten.matmul":                      _mm,
     "aten.linear.default":              _linear,
     "aten.linear":                      _linear,
-    # attention
-    "aten._scaled_dot_product_flash_attention.default": _scaled_dot_product_attention,
-    "aten.scaled_dot_product_attention.default":        _scaled_dot_product_attention,
-    "aten._scaled_dot_product_efficient_attention.default": _scaled_dot_product_attention,
-    # norm
+    # ── attention ─────────────────────────────────────────────────────────────
+    "aten._scaled_dot_product_flash_attention.default":    _scaled_dot_product_attention,
+    "aten.scaled_dot_product_attention.default":           _scaled_dot_product_attention,
+    "aten._scaled_dot_product_efficient_attention.default":_scaled_dot_product_attention,
+    # ── norm ──────────────────────────────────────────────────────────────────
     "aten.layer_norm.default":          _layer_norm,
     "aten.layer_norm":                  _layer_norm,
     "aten.native_layer_norm.default":   _layer_norm,
-    # softmax
+    # ── softmax ───────────────────────────────────────────────────────────────
     "aten._softmax.default":            _softmax,
     "aten.softmax.int":                 _softmax,
     "aten.special_softmax.int":         _softmax,
-    # elementwise — 1 op/elem
+    # ── elementwise — 1 op/elem ───────────────────────────────────────────────
     "aten.add.Tensor":                  _elementwise,
     "aten.add_.Tensor":                 _elementwise,
+    "aten.add.Scalar":                  _elementwise,
     "aten.sub.Tensor":                  _elementwise,
+    "aten.sub.Scalar":                  _elementwise,
+    "aten.rsub.Scalar":                 _elementwise,
+    "aten.rsub.default":                _elementwise,
     "aten.mul.Tensor":                  _elementwise,
     "aten.mul.Scalar":                  _elementwise,
     "aten.div.Tensor":                  _elementwise,
@@ -399,43 +592,101 @@ _EXACT_FORMULAS: dict[str, "callable"] = {
     "aten.rsqrt.default":               _elementwise,
     "aten.pow.Tensor_Scalar":           _elementwise,
     "aten.pow.Tensor_Tensor":           _elementwise,
-    # activation — ~4 ops/elem
+    "aten.masked_fill.Scalar":          _elementwise,
+    "aten.masked_fill_.Scalar":         _elementwise,
+    "aten.masked_fill.Tensor":          _elementwise,
+    # ── elementwise — ~2 ops/elem ─────────────────────────────────────────────
+    "aten.reciprocal.default":          lambda n: _elementwise(n, 2.0),
+    "aten.clamp.default":               lambda n: _elementwise(n, 2.0),
+    "aten.clamp.Scalar":                lambda n: _elementwise(n, 2.0),
+    "aten.clamp.Tensor":                lambda n: _elementwise(n, 2.0),
+    "aten.clamp_min.default":           lambda n: _elementwise(n, 2.0),
+    "aten.clamp_max.default":           lambda n: _elementwise(n, 2.0),
+    # ── activation — ~4 ops/elem ─────────────────────────────────────────────
     "aten.silu.default":                lambda n: _elementwise(n, 4.0),
     "aten.silu_.default":               lambda n: _elementwise(n, 4.0),
     "aten.gelu.default":                lambda n: _elementwise(n, 4.0),
     "aten.sigmoid.default":             lambda n: _elementwise(n, 4.0),
-    # embedding
+    # ── transcendental — ~10 ops/elem (CORDIC / polynomial approx) ───────────
+    "aten.sin.default":                 lambda n: _elementwise(n, 10.0),
+    "aten.cos.default":                 lambda n: _elementwise(n, 10.0),
+    "aten.atan2.default":               lambda n: _elementwise(n, 10.0),
+    # ── embedding / gather ────────────────────────────────────────────────────
     "aten.embedding.default":           _embedding,
-    # reduction
+    "aten.index.Tensor":                _gather,
+    "aten.index_select.default":        _gather,
+    "aten.gather.default":              _gather,
+    "aten.scatter.src":                 _gather,
+    "aten.scatter_.src":                _gather,
+    "aten.scatter_add.default":         _gather,
+    # ── reduction ─────────────────────────────────────────────────────────────
     "aten.mean.dim":                    lambda n: _elementwise(n, 1.0),
+    "aten.mean.default":                lambda n: _elementwise(n, 1.0),
     "aten.sum.dim_IntList":             lambda n: _elementwise(n, 1.0),
+    "aten.sum.default":                 lambda n: _elementwise(n, 1.0),
     "aten.var.correction":              lambda n: _elementwise(n, 3.0),
-    # memory / shape — trivial compute
+    "aten.amax.default":                lambda n: _elementwise(n, 1.0),
+    "aten.amin.default":                lambda n: _elementwise(n, 1.0),
+    # ── dtype cast ────────────────────────────────────────────────────────────
+    "aten._to_copy.default":            _dtype_cast,
+    # ── memory / shape — trivial compute ──────────────────────────────────────
     "aten.copy_.default":               lambda n: (0.0, float(n.total_input_bytes()), float(n.total_output_bytes())),
-    # fused semantic labels (from fusion engine)
+    # ── write-only allocation ops (0 compute) ─────────────────────────────────
+    "aten.new_empty.default":           _write_only,
+    "aten.new_empty_strided.default":   _write_only,
+    "aten.fill_.Scalar":                _write_only,
+    "aten.zero_.default":               _write_only,
+    # ── fused semantic labels from FusionEngine / FusionPass ──────────────────
+    # norm
     "rms_norm":                         _rms_norm,
     "layer_norm":                       _layer_norm,
     "add_rms_norm":                     _fused_norm,
     "add_layer_norm":                   _fused_norm,
+    "npu_add_rms_norm":                 _fused_norm,
+    # attention
     "flash_attn":                       _fused_attention,
     "sdpa":                             _fused_attention,
+    "sdpa_backward":                    _fused_attention,
     "npu_fusion_attention":             _fused_attention,
     "attn":                             _fused_attention,
+    "attn_grad":                        _fused_attention,
     "mla_attn":                         _fused_attention,
+    # MLP
     "gated_mlp":                        _fused_mlp,
+    "gated_mlp_backward":               _fused_mlp,
     "mlp":                              _fused_mlp,
+    "mlp_backward":                     _fused_mlp,
+    # MoE gate / router
     "moe_gate":                         lambda n: _fused_moe_gate(n, with_topk=False),
     "moe_gate_topk":                    lambda n: _fused_moe_gate(n, with_topk=True),
     "npu_moe_gate":                     lambda n: _fused_moe_gate(n, with_topk=False),
     "npu_moe_gate_topk":                lambda n: _fused_moe_gate(n, with_topk=True),
+    # MoE dispatch (scatter/gather routing)
+    "moe_dispatch":                     _gather,
+    "npu_moe_dispatch":                 _gather,
+    # MoE block / expert
     "moe_block":                        _fused_mlp,
     "moe_expert":                       _fused_mlp,
+    "moe_shared":                       _fused_mlp,
+    # RoPE
     "rope":                             lambda n: _elementwise(n, 2.0),
+    # Linear projection (single nn.Linear module grouped by FusionPass)
+    "Linear":                           _linear_proj,
+    # Norm backward (native fused kernel)
+    "norm_backward":                    _fused_norm,
+    # Embedding / lm_head
+    "embedding":                        _embedding,
+    "lm_head":                          _linear_proj,
+    "embedding_backward":               _embedding,
 }
 
 
 def _shape_ops_fmr(node: "OpNode") -> FMR:
-    """Shape/view/permute ops: near-zero compute, read ≈ write."""
+    """Shape/view/permute ops: view/reshape/expand/squeeze/permute/transpose
+       contiguous/flatten/as_strided/select/slice/clone/cat/stack/chunk/split
+    FLOPs ≈ 0  (元数据重解释, 实际可能零内存移动)
+    R≈|output|·b    W≈|output|·b  (保守估计, 连续内存实际为0)
+    """
     it = _itemsize(node)
     n = _numel(node.outputs[0].shape) if node.outputs else 1
     return 0.0, n * it, n * it
@@ -538,20 +789,27 @@ class RooflineSimulator(OpSimulator):
 
         Since we don't have intermediate tensor shapes, we use the node's
         external inputs and outputs to estimate the dominant matmul costs.
-        For everything else, we use the output-element heuristic.
+        Shape/transparent ops in fused_from are skipped (0 compute).
         """
         total_flops = 0.0
         total_read  = float(node.total_input_bytes())
         total_write = float(node.total_output_bytes())
 
         for sub_op in node.fused_from:
+            # Skip shape / transparent ops — they contribute no FLOPs
+            if any(sub_op.startswith(p) for p in _SHAPE_OP_PREFIXES):
+                continue
+            if sub_op in ("aten.detach.default", "aten.alias.default",
+                          "aten.lift_fresh_copy.default"):
+                continue
+
             fn = _EXACT_FORMULAS.get(sub_op)
             if fn is not None:
-                # Reuse the node's shapes as a proxy
-                f, r, w = fn(node)
+                # Reuse the node's shapes as a proxy for the dominant op
+                f, _r, _w = fn(node)
                 total_flops += f
             else:
-                # Unknown sub-op: 1 flop / output elem
+                # Unknown sub-op: 1 flop / output elem (conservative)
                 total_flops += sum(_numel(o.shape) for o in node.outputs)
 
         # Clamp read/write to at least actual tensor bytes

@@ -180,15 +180,26 @@ _MOE_RE     = r".*MoE.*|.*SparseMoe.*|.*Expert.*"
 _NORM_RE    = r".*RMSNorm.*|.*LayerNorm.*|.*RmsNorm.*"
 _EMBED_RE   = r".*Embed.*"
 
+# Broader regex used only for backward patterns: attention backward ops may be
+# attributed to parent decoder/encoder/block layers when inner attention module
+# backward hooks don't fire (e.g. non-Tensor outputs from the attention module).
+# The backward-specific aten ops (_softmax_backward_data, scaled_dot_product_attention_backward)
+# are unique to attention backward and serve as discriminators instead.
+_ATTN_BWD_RE = (
+    r".*Attention.*|.*SelfAttn.*|.*MultiHead.*|.*MLA.*"
+    r"|.*DecoderLayer.*|.*EncoderLayer.*|.*TransformerLayer.*|.*Block.*"
+)
+
 # ── CUDA patterns (H100 / A100 / A10 family) ─────────────────────────────────
 _CUDA_PATTERNS: List[SubPattern] = [
     # ── Backward patterns (priority 50+) ─────────────────────────────────────
-    # SDPA backward (single composite op)
-    SubPattern("sdpa_backward", _ATTN_RE,
+    # SDPA backward (single composite op) — use broad regex, op is uniquely backward
+    SubPattern("sdpa_backward", _ATTN_BWD_RE,
                [r"scaled_dot_product_attention_backward"],
                priority=50),
     # Attention backward: dQ/dK/dV via mm + softmax_backward + mm
-    SubPattern("attn_grad", _ATTN_RE,
+    # Use broad regex: _softmax_backward_data is uniquely diagnostic of attn backward
+    SubPattern("attn_grad", _ATTN_BWD_RE,
                [r"\b(mm|bmm|matmul)\b", r"_softmax_backward_data", r"\b(mm|bmm|matmul)\b"],
                priority=42),
     # Native norm backward (fused kernel: LayerNorm / GroupNorm)
@@ -237,10 +248,10 @@ _CUDA_PATTERNS: List[SubPattern] = [
 # ── Ascend NPU / CANN patterns ────────────────────────────────────────────────
 _ASCEND_PATTERNS: List[SubPattern] = [
     # ── Backward patterns ─────────────────────────────────────────────────────
-    SubPattern("sdpa_backward", _ATTN_RE,
+    SubPattern("sdpa_backward", _ATTN_BWD_RE,
                [r"scaled_dot_product_attention_backward"],
                priority=55),
-    SubPattern("attn_grad", _ATTN_RE,
+    SubPattern("attn_grad", _ATTN_BWD_RE,
                [r"\b(mm|bmm|matmul)\b", r"_softmax_backward_data", r"\b(mm|bmm|matmul)\b"],
                priority=45),
     SubPattern("norm_backward", _NORM_RE,
@@ -283,7 +294,7 @@ _ASCEND_PATTERNS: List[SubPattern] = [
 # ── CPU patterns ──────────────────────────────────────────────────────────────
 _CPU_PATTERNS: List[SubPattern] = [
     # ── Backward patterns ─────────────────────────────────────────────────────
-    SubPattern("sdpa_backward", _ATTN_RE,
+    SubPattern("sdpa_backward", _ATTN_BWD_RE,
                [r"scaled_dot_product_attention_backward"],
                priority=50),
     SubPattern("norm_backward", _NORM_RE,

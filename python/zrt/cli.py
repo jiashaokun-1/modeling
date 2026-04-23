@@ -100,6 +100,10 @@ def main() -> None:
         help="Expert-parallel degree (training, default: 1).",
     )
     parser.add_argument(
+        "--cp", type=int, default=1,
+        help="Context-parallel degree (training, default: 1).",
+    )
+    parser.add_argument(
         "--dp", type=int, default=1,
         help="Data-parallel degree (training, default: 1).",
     )
@@ -252,42 +256,121 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
 
 
 def _run_training_modelling(args, model_id: str, hw, result) -> None:
-    """Run the training modelling pipeline on already-captured graphs."""
-    from python.zrt.transform.analysis.modeller import estimate_training_from_graphs
+    """Run the full training pipeline: transform → schedule → simulate → report → export."""
+    from python.zrt.transform import (
+        build_default_pipeline, TransformContext,
+        ParallelConfig, StreamConfig,
+        TrainingMemoryPass, export_training_graphs,
+    )
+    from python.zrt.transform.context import TrainingConfig
+    from python.zrt.executor import DAGScheduler
+    from python.zrt.simulator import SimulatorHub
+    from python.zrt.report import build_training_summary
 
     fwd_pair = result.graphs.get("train_forward")
     if not fwd_pair:
         logger.error("--train --hw requires train_forward phase but none was captured.")
         return
 
-    fwd_graph = fwd_pair[0]  # raw OpGraph
+    raw_fwd = fwd_pair[0]
     bwd_pair = result.graphs.get("train_backward")
-    bwd_graph = bwd_pair[0] if bwd_pair else None
+    raw_bwd = bwd_pair[0] if bwd_pair else None
 
-    report = estimate_training_from_graphs(
-        forward_graph=fwd_graph,
-        backward_graph=bwd_graph,
+    cp = getattr(args, "cp", 1)
+    parallel_parts = []
+    if args.tp > 1: parallel_parts.append(f"TP{args.tp}")
+    if cp > 1:      parallel_parts.append(f"CP{cp}")
+    if args.ep > 1: parallel_parts.append(f"EP{args.ep}")
+    if args.pp > 1: parallel_parts.append(f"PP{args.pp}")
+    if args.dp > 1: parallel_parts.append(f"DP{args.dp}")
+    parallel_desc = "-".join(parallel_parts) if parallel_parts else "single"
+
+    ctx = TransformContext(
         hw_spec=hw,
-        total_params=int(args.total_params) if args.total_params else None,
-        hidden=args.hidden,
-        num_layers=args.layers,
-        num_layers_full=args.num_layers_full,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        tp=args.tp,
-        pp=args.pp,
-        ep=args.ep,
-        dp=args.dp,
-        zero_stage=args.zero_stage,
-        optimizer=args.optimizer,
-        micro_batch=args.micro_batch,
-        global_batch=args.global_batch,
+        parallel=ParallelConfig(tp=args.tp, cp=cp, ep=args.ep, pp=args.pp, dp=args.dp),
+        stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+        training=TrainingConfig(
+            optimizer=args.optimizer,
+            zero_stage=args.zero_stage,
+            micro_batch=args.micro_batch,
+            global_batch=args.global_batch,
+        ),
+    )
+    pipe = build_default_pipeline()
+    scheduler = DAGScheduler(hw_spec=hw)
+    hub = SimulatorHub.default()
+
+    fwd_transformed = pipe.run(raw_fwd, ctx)
+    fwd_tl = scheduler.schedule(fwd_transformed)
+    fwd_sim = hub.simulate_graph(fwd_transformed, hw)
+    print(f"  fwd: {raw_fwd.num_nodes()} -> {fwd_transformed.num_nodes()} nodes"
+          f"  total={fwd_tl.total_latency_ms:.3f} ms")
+
+    if raw_bwd is not None:
+        bwd_transformed = pipe.run(raw_bwd, ctx)
+        bwd_tl = scheduler.schedule(bwd_transformed)
+        bwd_sim = hub.simulate_graph(bwd_transformed, hw)
+        print(f"  bwd: {raw_bwd.num_nodes()} -> {bwd_transformed.num_nodes()} nodes"
+              f"  total={bwd_tl.total_latency_ms:.3f} ms")
+    else:
+        logger.warning("No train_backward graph captured; backward metrics will be zero.")
+        bwd_transformed = fwd_transformed
+        bwd_tl = fwd_tl
+        bwd_sim = {}
+
+    # Memory estimation
+    mem_ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=args.tp, cp=cp, ep=args.ep, pp=args.pp, dp=args.dp),
+        stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+        training=TrainingConfig(
+            optimizer=args.optimizer,
+            zero_stage=args.zero_stage,
+            micro_batch=args.micro_batch,
+            global_batch=args.global_batch,
+        ),
+    )
+    fwd_with_mem = TrainingMemoryPass().run(fwd_transformed, mem_ctx)
+    mem_bd = fwd_with_mem.metadata.get("memory_breakdown")
+
+    summary = build_training_summary(
+        model            = model_id,
+        hardware         = args.hw,
+        batch_size       = args.batch_size,
+        seq_len          = args.seq_len,
+        fwd_graph        = fwd_transformed,
+        bwd_graph        = bwd_transformed,
+        fwd_results      = fwd_sim,
+        bwd_results      = bwd_sim,
+        fwd_timeline     = fwd_tl,
+        bwd_timeline     = bwd_tl,
+        hw_spec          = hw,
+        parallel_desc    = parallel_desc,
+        memory_breakdown = mem_bd,
     )
 
     try:
-        print(f"\n{report.summary()}")
+        print(f"\n{summary}")
     except UnicodeEncodeError:
-        logger.info("Training report: %s", report.summary())
+        summary_str = str(summary).replace("µ", "u")
+        logger.info("Training summary:\n%s", summary_str)
+
+    # Export Excel + JSON
+    output_dir = result.output_dir / "transformed" if result.output_dir else None
+    if output_dir:
+        try:
+            export_result = export_training_graphs(
+                fwd_graph        = fwd_transformed,
+                bwd_graph        = bwd_transformed,
+                ctx              = ctx,
+                output_dir       = output_dir,
+                training_summary = summary,
+            )
+            print(f"\n  Excel:    {export_result['excel']}")
+            print(f"  JSON fwd: {export_result['json_fwd']}")
+            print(f"  JSON bwd: {export_result['json_bwd']}")
+        except Exception as exc:
+            logger.warning("Export failed: %s", exc)
 
 
 if __name__ == "__main__":

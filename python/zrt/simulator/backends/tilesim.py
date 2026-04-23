@@ -1,6 +1,6 @@
-from zrt.hardware import HardwareSpec
-from zrt.ir import OpNode
-from zrt.simulator import OpSimulator, SimResult
+from python.zrt.hardware import HardwareSpec
+from python.zrt.ir import OpNode
+from python.zrt.simulator import OpSimulator, SimResult
 
 class TilesimSimulator(OpSimulator):
     name = "tilesim"

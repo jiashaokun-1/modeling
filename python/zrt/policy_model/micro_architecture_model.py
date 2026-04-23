@@ -1,7 +1,7 @@
-from zrt.hardware import HardwareSpec
-from zrt.ir import OpNode
-from zrt.simulator import SimResult
-from zrt.policy_model.policy_base_model import PolicyBaseModel
+from python.zrt.hardware import HardwareSpec
+from python.zrt.ir import OpNode
+from python.zrt.simulator import SimResult
+from .policy_base_model import PolicyBaseModel
 
 class SystemDesignModel(PolicyBaseModel):
     def __init__(self):

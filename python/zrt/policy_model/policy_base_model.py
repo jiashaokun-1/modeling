@@ -1,10 +1,10 @@
 from abc import ABC, abstractmethod
 
-from zrt.simulator import OpSimulator
-from zrt.simulator.backends.backend_register import BackendType, BACKEND_MAP
-from zrt.hardware import HardwareSpec
-from zrt.ir import OpNode
-from zrt.simulator import SimResult
+from python.zrt.simulator import OpSimulator
+from python.zrt.simulator.backends.backend_register import BackendType, BACKEND_MAP
+from python.zrt.hardware import HardwareSpec
+from python.zrt.ir import OpNode
+from python.zrt.simulator import SimResult
 
 
 class PolicyBaseModel(ABC):

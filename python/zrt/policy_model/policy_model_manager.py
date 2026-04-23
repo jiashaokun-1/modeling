@@ -1,11 +1,11 @@
 from typing import Dict, Type, Union
 
-from zrt.simulator import OpSimulator
-from zrt.hardware import HardwareSpec
-from zrt.ir import OpNode
-from zrt.simulator import SimResult
-from zrt.policy_model.policy_register import POLICY_MAP, PolicyType
-from zrt.policy_model.policy_base_model import PolicyBaseModel
+from python.zrt.simulator import OpSimulator
+from python.zrt.hardware import HardwareSpec
+from python.zrt.ir import OpNode
+from python.zrt.simulator import SimResult
+from .policy_register import POLICY_MAP, PolicyType
+from .policy_base_model import PolicyBaseModel
 
 class PolicyModelManager:
 

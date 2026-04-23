@@ -3,7 +3,7 @@ from typing import Dict, Type
 from enum import Enum
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from zrt.policy_model.policy_base_model import PolicyBaseModel
+    from .policy_base_model import PolicyBaseModel
 
 class PolicyType(Enum):
     PRIORITY = 'priority'
@@ -13,10 +13,10 @@ class PolicyType(Enum):
 
 POLICY_MAP: Dict[PolicyType, Type['PolicyBaseModel']] = {}
 def register_model():
-    from zrt.policy_model.priority_model import PriorityModel
-    from zrt.policy_model.open_box_model import OpenBoxModel
-    from zrt.policy_model.op_aptimize_model import OperatorOptimizationModel
-    from zrt.policy_model.micro_architecture_model import SystemDesignModel
+    from .priority_model import PriorityModel
+    from .open_box_model import OpenBoxModel
+    from .op_aptimize_model import OperatorOptimizationModel
+    from .micro_architecture_model import SystemDesignModel
 
 
     POLICY_MAP.update({

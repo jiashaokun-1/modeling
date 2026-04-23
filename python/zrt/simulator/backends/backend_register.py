@@ -1,7 +1,7 @@
 from enum import Enum, auto
 from typing import Dict, Type
 
-from zrt.simulator import OpSimulator
+from python.zrt.simulator import OpSimulator
 import logging
 logger = logging.getLogger(__name__)
 
@@ -13,9 +13,9 @@ class BackendType(Enum):
 BACKEND_MAP: Dict[BackendType, Type['OpSimulator']] = {}
 
 def register_backend():
-    from zrt.simulator.backends.roofline import RooflineSimulator
-    from zrt.simulator.backends.lookup import LookupSimulator
-    from zrt.simulator.backends.tilesim import TilesimSimulator
+    from .roofline import RooflineSimulator
+    from .lookup import LookupSimulator
+    from .tilesim import TilesimSimulator
 
     BACKEND_MAP.update({
         BackendType.ROOFLINE: RooflineSimulator,

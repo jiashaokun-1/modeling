@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING
 from .base import OpSimulator
 from .cache import SimCache
 from .result import SimResult
-from zrt.policy_model.policy_model_manager import PolicyModelManager
-from zrt.policy_model.policy_register import PolicyType
+from python.zrt.policy_model.policy_model_manager import PolicyModelManager
+from python.zrt.policy_model.policy_register import PolicyType
 
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
@@ -61,7 +61,7 @@ class SimulatorHub:
 
     # ── simulation ───────────────────────────────────────────────────────────
 
-    def simulate(self, node: "OpNode", hw: "HardwareSpec", cost_model_policy: "PolicyType") -> SimResult:
+    def simulate(self, node: "OpNode", hw: "HardwareSpec", cost_model_policy: "PolicyType" = PolicyType.PRIORITY) -> SimResult:
         """Simulate a single node; uses cache when available."""
         cached = self._cache.get(node, hw)
         if cached is not None:

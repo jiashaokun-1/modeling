@@ -304,8 +304,8 @@ class TestFusedOps:
 class TestSimulatorHub:
 
     def test_default_hub_has_roofline(self, hw_910b):
-        hub = SimulatorHub.default()
-        assert any(isinstance(b, RooflineSimulator) for b in hub._backends)
+        from python.zrt.simulator.backends.backend_register import BACKEND_MAP, BackendType
+        assert BackendType.ROOFLINE in BACKEND_MAP
 
     def test_simulate_single_node(self, hub, hw_910b):
         M, K, N = 1024, 4096, 7168

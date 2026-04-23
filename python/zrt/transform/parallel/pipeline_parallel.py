@@ -1,219 +1,232 @@
+"""Pipeline Parallel pass: stage assignment + P2P boundary insertion.
+
+For each node annotates ``node.annotations["stage_id"] = int`` (0-indexed).
+Inserts ``comm.send_recv`` nodes at stage boundaries to model activation
+transfer latency between adjacent pipeline stages.
+
+Layer partitioning uses greedy bin-packing by accumulated per-layer compute
+load (``compute_us`` → ``latency_us`` → ``flops`` → 1.0 fallback), which
+approximates load-balanced stage assignment without requiring a pre-pass.
+An explicit ``TrainingConfig.pp_layer_assignment`` list overrides this.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Set
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, TYPE_CHECKING
 
-from zrt.ir.graph import OpGraph
-from zrt.ir.node import OpNode, Edge
-from zrt.ir.types import TensorMeta
-from zrt.transform.base import GraphPass
-from zrt.transform.context import TransformContext
+from python.zrt.ir.edge import Edge
+from python.zrt.ir.node import OpNode
+from python.zrt.ir.types import TensorMeta, DType
+from python.zrt.transform.base import GraphPass
+
+if TYPE_CHECKING:
+    from python.zrt.ir.graph import OpGraph
+    from python.zrt.transform.context import TransformContext
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class LayerInfo:
-    """Layer information for pipeline parallel partitioning."""
-    layer_id: int
-    layer_kind: str
-    total_flops: float
-    node_ids: Set[str]
+class LayerGroup:
+    """Layers assigned to a single pipeline stage."""
+    stage_id: int
+    layer_ids: List[int] = field(default_factory=list)
+    node_ids: Set[str] = field(default_factory=set)
+    total_compute_us: float = 0.0
 
 
 class PipelineParallelPass(GraphPass):
-    """Pipeline Parallel pass for layer assignment and P2P insertion."""
+    """Annotate pipeline stage IDs and insert P2P comm nodes at boundaries.
+
+    Pass order: runs in the ``split`` stage, after TP/EP but before Fusion.
+    Requires ``ctx.parallel.pp > 1`` to do anything.
+
+    Annotations written
+    -------------------
+    ``node.annotations["stage_id"]`` : int  — 0-indexed pipeline stage.
+    """
+
     name = "pipeline_parallel"
 
-    def run(self, graph: OpGraph, ctx: TransformContext) -> OpGraph:
-        """Run pipeline parallel pass on the graph.
-        
-        Args:
-            graph: Input OpGraph
-            ctx: TransformContext with parallel config and training config
-            
-        Returns:
-            New OpGraph with pipeline parallel annotations and P2P nodes
-        """
-        if ctx.parallel.pp <= 1:
-            return graph
-        
-        g = graph.clone()
-        pp = ctx.parallel.pp
-        pp_layer_assignment = ctx.training.pp_layer_assignment if ctx.training else None
+    def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
+        from python.zrt.ir.graph import OpGraph  # local to avoid circular
 
-        # 1. Collect layer information from graph hierarchy
-        layers = self._collect_layers(g)
-        
-        # 2. Partition layers into pipeline stages
-        stages = self._partition_layers(layers, pp, pp_layer_assignment)
-        
-        # 3. Annotate each node with its pipeline stage
+        pp = ctx.parallel.pp if ctx.parallel else 1
+
+        if pp <= 1:
+            # Annotate everything as stage 0 for consistency with downstream passes
+            g = graph.clone()
+            for node in g.nodes.values():
+                node.annotations.setdefault("stage_id", 0)
+            return g
+
+        g = graph.clone()
+
+        pp_layer_assignment: Optional[List[int]] = (
+            getattr(ctx.training, "pp_layer_assignment", None)
+            if ctx.training else None
+        )
+
+        # 1. Build layer_id → {node_ids} and per-layer compute load
+        layer_nodes: Dict[int, Set[str]] = {}
+        layer_load:  Dict[int, float]    = {}
+
         for node in g.nodes.values():
-            node.annotations["pp_stage"] = self._get_node_stage(node, stages)
-        
-        # 4. Insert P2P communication nodes at stage boundaries
-        self._insert_p2p_communication(g, stages)
-        
-        # 5. Warn if stage balance is poor
-        self._check_stage_balance(stages)
-        
+            try:
+                layer_idx = int(node.layer) if node.layer else -1
+            except (ValueError, TypeError):
+                layer_idx = -1
+
+            layer_nodes.setdefault(layer_idx, set()).add(node.id)
+
+            load = (
+                node.annotations.get("compute_us")
+                or node.annotations.get("latency_us")
+                or node.annotations.get("flops", 0) / 1e12
+                or 1.0
+            )
+            layer_load[layer_idx] = layer_load.get(layer_idx, 0.0) + load
+
+        sorted_layers = sorted(k for k in layer_nodes if k >= 0)
+
+        # 2. Partition layers → pp stages
+        stages = self._partition(sorted_layers, layer_nodes, layer_load,
+                                 pp, pp_layer_assignment)
+
+        # 3. Build lookup: layer_id → stage_id
+        layer_to_stage: Dict[int, int] = {
+            lid: s.stage_id
+            for s in stages
+            for lid in s.layer_ids
+        }
+
+        # 4. Annotate stage_id on every node
+        for node in g.nodes.values():
+            try:
+                layer_idx = int(node.layer) if node.layer else -1
+            except (ValueError, TypeError):
+                layer_idx = -1
+            node.annotations["stage_id"] = layer_to_stage.get(layer_idx, 0)
+
+        # 5. Insert P2P send_recv at each stage boundary
+        self._insert_p2p_nodes(g, stages)
+
+        # 6. Warn if imbalanced
+        self._check_balance(stages)
+
         return g
 
-    def _collect_layers(self, graph: OpGraph) -> List[LayerInfo]:
-        """Collect layer information from the graph hierarchy.
-        
-        Args:
-            graph: OpGraph to collect layers from
-            
-        Returns:
-            List of LayerInfo objects
-        """
-        layers = []
-        layer_id = 0
-        
-        # Get layers from hierarchy at depth 2 (assuming depth 0 is full graph, 1 is major components)
-        for layer_node in graph.hierarchy.at_depth(2):
-            if "layer" in layer_node.scope.lower():
-                node_ids = set(layer_node.leaf_node_ids)
-                total_flops = sum(
-                    node.annotations.get("flops", 0) 
-                    for node_id in node_ids 
-                    if node_id in graph.nodes
-                )
-                
-                layer_kind = "dense"
-                if "moe" in layer_node.scope.lower():
-                    layer_kind = "moe"
-                elif "mtp" in layer_node.scope.lower():
-                    layer_kind = "mtp"
-                
-                layers.append(LayerInfo(
-                    layer_id=layer_id,
-                    layer_kind=layer_kind,
-                    total_flops=total_flops,
-                    node_ids=node_ids
-                ))
-                layer_id += 1
-        
-        return layers
+    # ── partitioning ──────────────────────────────────────────────────────────
 
-    def _partition_layers(self, layers: List[LayerInfo], pp: int, 
-                         pp_layer_assignment: List[int] | None) -> List[List[LayerInfo]]:
-        """Partition layers into pipeline stages.
-        
-        Args:
-            layers: List of LayerInfo objects
-            pp: Number of pipeline stages
-            pp_layer_assignment: Explicit layer assignment or None for automatic
-            
-        Returns:
-            List of stages, each containing a list of LayerInfo objects
-        """
-        stages = [[] for _ in range(pp)]
-        
-        if pp_layer_assignment:
-            # Use explicit assignment
-            for layer_idx, stage_idx in enumerate(pp_layer_assignment):
-                if layer_idx < len(layers) and stage_idx < pp:
-                    stages[stage_idx].append(layers[layer_idx])
+    def _partition(
+        self,
+        sorted_layers: List[int],
+        layer_nodes: Dict[int, Set[str]],
+        layer_load: Dict[int, float],
+        pp: int,
+        explicit: Optional[List[int]],
+    ) -> List[LayerGroup]:
+        stages = [LayerGroup(stage_id=i) for i in range(pp)]
+
+        if not sorted_layers:
+            return stages
+
+        if explicit and len(explicit) == len(sorted_layers):
+            # User-specified assignment: explicit[i] is the stage for sorted_layers[i]
+            for idx, layer_id in enumerate(sorted_layers):
+                s_idx = max(0, min(explicit[idx], pp - 1))
+                stages[s_idx].layer_ids.append(layer_id)
+                stages[s_idx].node_ids.update(layer_nodes[layer_id])
+                stages[s_idx].total_compute_us += layer_load.get(layer_id, 0.0)
         else:
-            # Use greedy bin-packing to balance stages
-            stage_flops = [0.0] * pp
-            
-            for layer in layers:
-                # Find stage with minimum flops
-                min_stage_idx = stage_flops.index(min(stage_flops))
-                stages[min_stage_idx].append(layer)
-                stage_flops[min_stage_idx] += layer.total_flops
-        
+            # Greedy bin-packing: always assign to the lightest stage
+            stage_load = [0.0] * pp
+            for layer_id in sorted_layers:
+                min_s = int(min(range(pp), key=lambda i: stage_load[i]))
+                stages[min_s].layer_ids.append(layer_id)
+                stages[min_s].node_ids.update(layer_nodes[layer_id])
+                load = layer_load.get(layer_id, 0.0)
+                stages[min_s].total_compute_us += load
+                stage_load[min_s] += load
+
         return stages
 
-    def _get_node_stage(self, node: OpNode, stages: List[List[LayerInfo]]) -> int:
-        """Get the pipeline stage for a node.
-        
-        Args:
-            node: OpNode to find stage for
-            stages: List of stages
-            
-        Returns:
-            Pipeline stage index
-        """
-        for stage_idx, stage_layers in enumerate(stages):
-            for layer in stage_layers:
-                if node.id in layer.node_ids:
-                    return stage_idx
-        return 0  # Default to stage 0 if not found
+    # ── P2P insertion ─────────────────────────────────────────────────────────
 
-    def _insert_p2p_communication(self, graph: OpGraph, stages: List[List[LayerInfo]]):
-        """Insert P2P communication nodes at stage boundaries.
-        
-        Args:
-            graph: OpGraph to modify
-            stages: List of stages
-        """
-        # Get all nodes in each stage
-        stage_nodes = []
-        for stage in stages:
-            stage_node_ids = set()
-            for layer in stage:
-                stage_node_ids.update(layer.node_ids)
-            stage_nodes.append(stage_node_ids)
-        
-        # Insert P2P between stages
+    def _insert_p2p_nodes(self, graph: "OpGraph",
+                          stages: List[LayerGroup]) -> None:
+        """Insert one comm.send_recv node per stage boundary."""
+        topo = graph.topo_sort()
+        topo_rank = {n.id: i for i, n in enumerate(topo)}
+
         for i in range(len(stages) - 1):
-            current_stage_nodes = stage_nodes[i]
-            next_stage_nodes = stage_nodes[i + 1]
-            
-            # Find last node in current stage and first node in next stage
-            last_node = None
-            first_node = None
-            
-            # Use topological order to find last node in current stage
-            for node in graph.topo_sort():
-                if node.id in current_stage_nodes:
-                    last_node = node
-                elif node.id in next_stage_nodes and first_node is None:
-                    first_node = node
-                    break
-            
-            if last_node and first_node:
-                # Create P2P communication node
-                p2p_node = OpNode(
-                    id=f"comm_p2p_{i}_{i+1}",
-                    op_type="comm.send_recv",
-                    inputs=last_node.outputs.copy(),
-                    outputs=first_node.inputs.copy(),
-                    attrs={
-                        "src_stage": i,
-                        "dst_stage": i + 1,
-                        "message_size": sum(t.memory_bytes for t in last_node.outputs)
-                    },
-                    scope=f"pipeline.p2p.{i}_{i+1}",
-                    category="communication"
-                )
-                
-                # Insert P2P node between last_node and first_node
-                # This is a simplified implementation - in practice, you'd need to rewire edges
-                graph.insert_after(last_node.id, p2p_node, [])
+            src_stage = stages[i]
+            if not src_stage.node_ids:
+                continue
 
-    def _check_stage_balance(self, stages: List[List[LayerInfo]]):
-        """Check if stage balance is acceptable.
-        
-        Args:
-            stages: List of stages
-        """
-        if not stages:
+            # Last node in the sending stage (highest topo rank)
+            valid_src = [nid for nid in src_stage.node_ids if nid in topo_rank]
+            if not valid_src:
+                continue
+            last_src_id = max(valid_src, key=lambda nid: topo_rank[nid])
+            last_src = graph.nodes[last_src_id]
+
+            # Size of the activation crossing the boundary
+            act_bytes = sum(t.mem_bytes for t in last_src.outputs)
+            if act_bytes == 0:
+                act_bytes = 4  # sentinel for scalar activation
+
+            # Build output TensorMeta for the received activation
+            if last_src.outputs:
+                ref_out = last_src.outputs[0]
+                recv_tensor = TensorMeta(
+                    id=f"p2p_act_{i}_{i+1}_0",
+                    shape=ref_out.shape,
+                    dtype=ref_out.dtype,
+                    mem_bytes=ref_out.mem_bytes,
+                )
+            else:
+                recv_tensor = TensorMeta.from_shape_dtype(
+                    f"p2p_act_{i}_{i+1}_0", (1,), DType.BF16
+                )
+
+            p2p_id = f"comm_p2p_{i}_{i+1}"
+            p2p_node = OpNode(
+                id=p2p_id,
+                op_type="comm.send_recv",
+                inputs=list(last_src.outputs),
+                outputs=[recv_tensor],
+                attrs={
+                    "src_stage": i,
+                    "dst_stage": i + 1,
+                    "message_size_bytes": act_bytes,
+                },
+                scope=f"pipeline.p2p.stage{i}_to_{i+1}",
+                category="communication",
+            )
+            p2p_node.annotations["stage_id"] = i  # belongs to the sending stage
+
+            # Wire: last_src_id → p2p_node
+            p2p_edge = Edge(
+                src=last_src_id,
+                src_idx=0,
+                dst=p2p_id,
+                dst_idx=0,
+                tensor=last_src.outputs[0] if last_src.outputs else None,
+            )
+            graph.insert_after(last_src_id, p2p_node, [p2p_edge])
+
+    # ── balance check ─────────────────────────────────────────────────────────
+
+    def _check_balance(self, stages: List[LayerGroup]) -> None:
+        loads = [s.total_compute_us for s in stages if s.total_compute_us > 0]
+        if len(loads) < 2:
             return
-        
-        stage_flops = []
-        for stage in stages:
-            total_flops = sum(layer.total_flops for layer in stage)
-            stage_flops.append(total_flops)
-        
-        if stage_flops:
-            max_flops = max(stage_flops)
-            min_flops = min(stage_flops)
-            if min_flops > 0:
-                balance_ratio = max_flops / min_flops
-                if balance_ratio > 1.1:
-                    import warnings
-                    warnings.warn(f"Pipeline stage balance ratio is {balance_ratio:.2f} > 1.1, consider adjusting layer assignment")
+        ratio = max(loads) / min(loads)
+        if ratio > 1.5:
+            logger.warning(
+                "PipelineParallelPass: stage imbalance %.2fx (max/min). "
+                "Consider setting --pp-layer-assignment.",
+                ratio,
+            )

@@ -6,6 +6,7 @@ from python.zrt.transform.context import (
 from python.zrt.transform.pipeline import TransformPipeline, build_default_pipeline, build_training_pipeline
 from python.zrt.transform.parallel import (
     TensorParallelPass, ExpertParallelPass, CommInserterPass,
+    PipelineParallelPass,
 )
 from python.zrt.transform.fusion import FusionPass
 from python.zrt.transform.optim import QuantizationPass, EPLBPass, SharedExpertPass, MTPPass
@@ -28,6 +29,7 @@ __all__ = [
     "TransformPipeline", "build_default_pipeline", "build_training_pipeline",
     # passes
     "TensorParallelPass", "ExpertParallelPass", "CommInserterPass",
+    "PipelineParallelPass",
     "FusionPass",
     "QuantizationPass", "EPLBPass", "SharedExpertPass", "MTPPass",
     "FlopsPass", "RooflinePass", "CommLatencyPass", "StreamAssignPass",

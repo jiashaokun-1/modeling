@@ -214,38 +214,61 @@ class TrainingPipelinePass(GraphPass):
         pp = ctx.parallel.pp if ctx.parallel else 1
         num_microbatches = ctx.training.num_microbatches if ctx.training else 1
         hw = ctx.hw_spec
+        layer_scale = g.metadata.get("layer_scale", 1.0)
 
         from python.zrt.executor.scheduler import DAGScheduler
-
         sched = DAGScheduler(hw)
-        timeline = sched.schedule(g)
-        stage_time_us = timeline.total_latency_us
 
-        # Scale traced-subset latency to full model
-        layer_scale = g.metadata.get("layer_scale", 1.0)
-        if layer_scale != 1.0:
-            stage_time_us *= layer_scale
+        if pp > 1 and any("stage_id" in n.annotations for n in g.nodes.values()):
+            # Per-stage scheduling: schedule each stage's subgraph independently
+            stage_node_sets: dict[int, set[str]] = {}
+            for node in g.nodes.values():
+                sid = node.annotations.get("stage_id", 0)
+                stage_node_sets.setdefault(sid, set()).add(node.id)
 
-        per_stage_us = stage_time_us / pp if pp > 0 else stage_time_us
+            stage_latencies: dict[int, float] = {}
+            for s_id in range(pp):
+                node_ids = stage_node_sets.get(s_id, set())
+                if not node_ids:
+                    stage_latencies[s_id] = 0.0
+                    continue
+                sub = g.subgraph(node_ids)
+                tl = sched.schedule(sub)
+                lat = tl.total_latency_us
+                if layer_scale != 1.0:
+                    lat *= layer_scale
+                stage_latencies[s_id] = lat
+
+            g.metadata["stage_timelines_fwd"] = dict(stage_latencies)
+
+            # Bottleneck stage (max per-stage fwd latency)
+            per_stage_us = max(stage_latencies.values(), default=0.0)
+        else:
+            # pp=1 (or stage_id not yet annotated): whole graph is one stage
+            tl = sched.schedule(g)
+            per_stage_us = tl.total_latency_us
+            if layer_scale != 1.0:
+                per_stage_us *= layer_scale
 
         warmup_steps = max(0, pp - 1)
         cooldown_steps = max(0, pp - 1)
         steady_steps = max(0, num_microbatches - pp + 1)
+        total_steps = warmup_steps + num_microbatches + cooldown_steps
 
-        step_time_us = per_stage_us * (warmup_steps + num_microbatches + cooldown_steps)
+        # 1F1B step time: warmup + M microbatches through bottleneck + cooldown
+        step_time_us = per_stage_us * total_steps
         step_time_ms = step_time_us / 1000.0
         per_stage_ms = per_stage_us / 1000.0
 
-        total_steps = warmup_steps + num_microbatches + cooldown_steps
-        bubble_fraction = (warmup_steps + cooldown_steps) / total_steps if total_steps > 0 else 0.0
+        bubble_fraction = (
+            (warmup_steps + cooldown_steps) / total_steps if total_steps > 0 else 0.0
+        )
 
         training_flops = g.metadata.get("training_flops", 0.0)
         world_size = ctx.parallel.total_devices if ctx.parallel else 1
 
         from python.zrt.ir.types import DType
-        # BF16 is the standard compute dtype for mixed-precision training
-        compute_dtype = DType.BF16
-        peak_flops_per_gpu = hw.peak_flops(compute_dtype)
+        peak_flops_per_gpu = hw.peak_flops(DType.BF16)
 
         step_time_sec = step_time_us / 1e6
         achieved_flops = training_flops / step_time_sec if step_time_sec > 0 else 0.0
@@ -263,5 +286,4 @@ class TrainingPipelinePass(GraphPass):
         )
 
         g.metadata["pipeline_metrics"] = metrics
-
         return g

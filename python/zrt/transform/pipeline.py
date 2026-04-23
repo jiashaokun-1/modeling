@@ -54,6 +54,7 @@ def build_default_pipeline() -> TransformPipeline:
     """Build the standard 4-stage pipeline with all default passes registered."""
     from python.zrt.transform.parallel import (
         TensorParallelPass, ExpertParallelPass, CommInserterPass,
+        PipelineParallelPass,
     )
     from python.zrt.transform.fusion import FusionPass
     from python.zrt.transform.optim import (
@@ -70,6 +71,8 @@ def build_default_pipeline() -> TransformPipeline:
              condition=lambda c: c.parallel.ep > 1)
     pipe.add("split", CommInserterPass(),
              condition=lambda c: c.parallel.tp > 1 or c.parallel.ep > 1)
+    pipe.add("split", PipelineParallelPass(),
+             condition=lambda c: c.parallel.pp > 1)
 
     # ── Stage 2: Fuse ─────────────────────────────────────────────────────────
     pipe.add("fuse", FusionPass())
@@ -102,6 +105,7 @@ def build_training_pipeline() -> TransformPipeline:
     """
     from python.zrt.transform.parallel import (
         TensorParallelPass, ExpertParallelPass, CommInserterPass,
+        PipelineParallelPass,
     )
     from python.zrt.transform.fusion import FusionPass
     from python.zrt.transform.analysis import (
@@ -120,6 +124,8 @@ def build_training_pipeline() -> TransformPipeline:
              condition=lambda c: c.parallel.ep > 1)
     pipe.add("split", CommInserterPass(),
              condition=lambda c: c.parallel.tp > 1 or c.parallel.ep > 1)
+    pipe.add("split", PipelineParallelPass(),
+             condition=lambda c: c.parallel.pp > 1)
 
     # ── Stage 2: Fuse ─────────────────────────────────────────────────────────
     pipe.add("fuse", FusionPass())

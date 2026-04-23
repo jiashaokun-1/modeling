@@ -79,6 +79,10 @@ class TrainingConfig:
     # Pipeline schedule
     pp_schedule: str = "1f1b"  # "1f1b", "interleaved", "dualpipe"
 
+    # Optional explicit layer→stage assignment for PP; length must equal
+    # the number of traced transformer layers.  None → greedy bin-packing.
+    pp_layer_assignment: list[int] | None = None
+
     @property
     def num_microbatches(self) -> int:
         return self.global_batch // self.micro_batch

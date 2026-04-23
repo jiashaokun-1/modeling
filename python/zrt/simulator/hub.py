@@ -21,7 +21,8 @@ from typing import TYPE_CHECKING
 from .base import OpSimulator
 from .cache import SimCache
 from .result import SimResult
-from .backends.roofline import RooflineSimulator
+from zrt.policy_model.policy_model_manager import PolicyModelManager
+from zrt.policy_model.policy_register import PolicyType
 
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
@@ -45,15 +46,14 @@ class SimulatorHub:
     def __init__(self, *, with_roofline: bool = True) -> None:
         self._backends: list[OpSimulator] = []
         self._cache = SimCache()
-        if with_roofline:
-            self.register(RooflineSimulator())
+
+        self.policy_model_manager = PolicyModelManager()
 
     # ── registration ─────────────────────────────────────────────────────────
 
     def register(self, backend: OpSimulator) -> None:
         """Register a backend and re-sort by priority (highest first)."""
-        self._backends.append(backend)
-        self._backends.sort(key=lambda b: b.priority, reverse=True)
+        self.policy_model_manager.register_backend(backend)
         logger.debug(
             "SimulatorHub: registered backend %r (priority=%d)",
             backend.name, backend.priority,
@@ -61,27 +61,28 @@ class SimulatorHub:
 
     # ── simulation ───────────────────────────────────────────────────────────
 
-    def simulate(self, node: "OpNode", hw: "HardwareSpec") -> SimResult:
+    def simulate(self, node: "OpNode", hw: "HardwareSpec", cost_model_policy: "PolicyType") -> SimResult:
         """Simulate a single node; uses cache when available."""
         cached = self._cache.get(node, hw)
         if cached is not None:
             return cached
 
-        for backend in self._backends:
-            if backend.can_simulate(node, hw):
-                result = backend.simulate(node, hw)
-                self._cache.put(node, hw, result)
-                return result
+        result = self.policy_model_manager.simulate(node, hw, cost_model_policy)
 
-        raise RuntimeError(
-            f"No backend can simulate op_type={node.op_type!r} on hw={hw.name!r}. "
-            "Register a RooflineSimulator or pass with_roofline=True."
-        )
+        self._cache.put(node, hw, result)
+        if result is None:
+            raise RuntimeError(
+                f"No backend can simulate op_type={node.op_type!r} on hw={hw.name!r}. "
+                "Register a RooflineSimulator or pass with_roofline=True."
+            )
+        return result
+
 
     def simulate_graph(
         self,
         graph: "OpGraph",
         hw: "HardwareSpec",
+        cost_model_policy: "PolicyType" = PolicyType.PRIORITY
     ) -> dict[str, SimResult]:
         """Simulate every node in *graph* in topological order.
 
@@ -90,10 +91,11 @@ class SimulatorHub:
         results: dict[str, SimResult] = {}
         nodes = graph.topo_sort()
         logger.debug(
-            "SimulatorHub.simulate_graph: %d nodes, hw=%s", len(nodes), hw.name
+            "SimulatorHub.simulate_graph: %d nodes, hw=%s, costmodel_policy=%s",
+            len(nodes), hw.name, cost_model_policy.name
         )
         for node in nodes:
-            results[node.id] = self.simulate(node, hw)
+            results[node.id] = self.simulate(node, hw, cost_model_policy)
         return results
 
     # ── cache control ────────────────────────────────────────────────────────

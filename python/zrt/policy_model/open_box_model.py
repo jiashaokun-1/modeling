@@ -1,14 +1,11 @@
-
-
-from typing import List
-from zrt.layers.op_base import OperatorBase
-from zrt.tensor_base import TensorBase
-from zrt.runtime_config import RuntimeConfig
+from zrt.hardware import HardwareSpec
+from zrt.ir import OpNode
+from zrt.simulator import SimResult
 from zrt.policy_model.policy_base_model import PolicyBaseModel
 
 class OpenBoxModel(PolicyBaseModel):
-    def __init__(self, rt_config: RuntimeConfig):
-        super().__init__(rt_config)
+    def __init__(self):
+        super().__init__()
     
-    def predict(self, op: OperatorBase, input_tensor: List[TensorBase], **kwargs) -> float:
-        return 0.0
+    def predict(self, node: "OpNode", hw: "HardwareSpec") -> SimResult:
+        pass

@@ -213,6 +213,7 @@ class CommInserterPass(GraphPass):
                         category="communication",
                     )
                     pre_comm.annotations["inserted_by"] = "cp_pass"
+                    g.nodes[pre_comm.id] = pre_comm
                     _prepend_comm(g, node.id, pre_comm)
 
                 if post_comm_id not in g.nodes:
@@ -250,6 +251,8 @@ class CommInserterPass(GraphPass):
                             category="communication",
                         )
                         p2p_comm.annotations["inserted_by"] = "cp_pass"
+                        p2p_comm.annotations["overlap_target"] = node.id
+                        g.nodes[p2p_comm.id] = p2p_comm
                         # Insert P2P node before the attention operation
                         _prepend_comm(g, node.id, p2p_comm)
 

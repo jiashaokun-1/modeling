@@ -320,6 +320,26 @@ class TrainingPipelinePass(GraphPass):
         step_time_ms = step_time_us / 1000.0
         per_stage_ms = per_stage_us / 1000.0
 
+        bubble_fraction = (pp - 1) / effective_steps if effective_steps > 0 else 0.0
+
+        # DP-in-bubble: if DP AR fits inside the bubble window, it is free;
+        # otherwise the exposed portion adds to step time.
+        dp = ctx.parallel.dp if ctx.parallel else 1
+        if dp > 1 and ctx.training and ctx.training.dp_overlap_in_bubble:
+            dp_comm_nodes = [
+                n for n in g.nodes.values()
+                if n.annotations.get("dp_comm") and n.attrs.get("bucket_bytes", 0) > 0
+            ]
+            if dp_comm_nodes:
+                bucket_bytes = sum(n.attrs["bucket_bytes"] for n in dp_comm_nodes)
+                dp_bw_bytes_per_us = hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8 / 1e6
+                ring_factor = 2.0 * (dp - 1) / dp
+                t_dp_ar_us = ring_factor * bucket_bytes / dp_bw_bytes_per_us if dp_bw_bytes_per_us > 0 else 0.0
+                bubble_us = (pp - 1) * per_stage_us
+                t_exposed_dp_us = max(0.0, t_dp_ar_us - bubble_us)
+                step_time_us += t_exposed_dp_us
+                step_time_ms = step_time_us / 1000.0
+
         training_flops = g.metadata.get("training_flops", 0.0)
         world_size = ctx.parallel.total_devices if ctx.parallel else 1
 

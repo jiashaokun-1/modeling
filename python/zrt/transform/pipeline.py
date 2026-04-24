@@ -50,27 +50,47 @@ class TransformPipeline:
         return "\n".join(lines)
 
 
-def build_default_pipeline() -> TransformPipeline:
-    """Build the standard 4-stage pipeline with all default passes registered."""
+def build_pipeline() -> TransformPipeline:
+    """Build the unified transform pipeline for both inference and training.
+
+    Pass selection is fully condition-driven:
+    - Training passes (ZeRO, TrainFlops, TrainingMemory, TrainingPipeline) only
+      run when ctx.training is not None.
+    - DP / CP passes only run when the corresponding degree > 1 (and training for DP).
+    - CommInsert fires when TP, EP, or CP > 1.
+    """
     from python.zrt.transform.parallel import (
         TensorParallelPass, ExpertParallelPass, CommInserterPass,
         PipelineParallelPass,
     )
+    from python.zrt.transform.parallel.context_parallel import ContextParallelPass
+    from python.zrt.transform.parallel.data_parallel import DataParallelPass
     from python.zrt.transform.fusion import FusionPass
     from python.zrt.transform.optim import (
         QuantizationPass, EPLBPass, SharedExpertPass, MTPPass,
     )
-    from python.zrt.transform.analysis import FlopsPass, RooflinePass, CommLatencyPass, StreamAssignPass
+    from python.zrt.transform.analysis import (
+        FlopsPass, RooflinePass, CommLatencyPass, StreamAssignPass,
+        TrainFlopsPass,
+        TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
+    )
+    from python.zrt.transform.training.zero_fsdp import ZeroFSDPPass
+
+    is_train = lambda c: c.is_training
 
     pipe = TransformPipeline()
 
     # ── Stage 1: Split ────────────────────────────────────────────────────────
+    pipe.add("split", DataParallelPass(),
+             condition=lambda c: c.parallel.dp > 1 and c.is_training)
     pipe.add("split", TensorParallelPass(),
              condition=lambda c: c.parallel.tp > 1)
     pipe.add("split", ExpertParallelPass(),
              condition=lambda c: c.parallel.ep > 1)
+    pipe.add("split", ContextParallelPass(),
+             condition=lambda c: c.parallel.cp > 1)
     pipe.add("split", CommInserterPass(),
-             condition=lambda c: c.parallel.tp > 1 or c.parallel.ep > 1)
+             condition=lambda c: c.parallel.tp > 1 or c.parallel.ep > 1 or c.parallel.cp > 1)
     pipe.add("split", PipelineParallelPass(),
              condition=lambda c: c.parallel.pp > 1)
 
@@ -86,67 +106,21 @@ def build_default_pipeline() -> TransformPipeline:
              condition=lambda c: "shared_expert_external" in c.optim_flags)
     pipe.add("optim", MTPPass(),
              condition=lambda c: "mtp" in c.optim_flags)
-
-    # ── Stage 4: Analyze ──────────────────────────────────────────────────────
-    pipe.add("analyze", FlopsPass())
-    pipe.add("analyze", RooflinePass())
-    pipe.add("analyze", CommLatencyPass())  # Override comm latency with interconnect BW
-    pipe.add("analyze", StreamAssignPass())
-
-    return pipe
-
-
-def build_training_pipeline() -> TransformPipeline:
-    """Build the training pipeline: reuse all inference passes + training analysis passes.
-
-    The inference passes (TP, EP, CommInsert, Fusion, Flops, Roofline, CommLatency,
-    StreamAssign) run unconditionally.  The training-specific passes (TrainingFlops,
-    TrainingMemory, TrainingPipeline) are conditioned on ``ctx.training is not None``.
-    """
-    from python.zrt.transform.parallel import (
-        TensorParallelPass, ExpertParallelPass, CommInserterPass,
-        PipelineParallelPass,
-    )
-    from python.zrt.transform.fusion import FusionPass
-    from python.zrt.transform.analysis import (
-        FlopsPass, RooflinePass, CommLatencyPass, StreamAssignPass,
-        TrainFlopsPass,
-        TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
-    )
-    from python.zrt.transform.training.zero_fsdp import ZeroFSDPPass
-
-    is_train = lambda c: c.training is not None
-
-    pipe = TransformPipeline()
-
-    # ── Stage 1: Split ────────────────────────────────────────────────────────
-    pipe.add("split", TensorParallelPass(),
-             condition=lambda c: c.parallel.tp > 1)
-    pipe.add("split", ExpertParallelPass(),
-             condition=lambda c: c.parallel.ep > 1)
-    pipe.add("split", CommInserterPass(),
-             condition=lambda c: c.parallel.tp > 1 or c.parallel.ep > 1)
-    pipe.add("split", PipelineParallelPass(),
-             condition=lambda c: c.parallel.pp > 1)
-
-    # ── Stage 2: Fuse ─────────────────────────────────────────────────────────
-    pipe.add("fuse", FusionPass())
-
-    # ── Stage 3: Optim ────────────────────────────────────────────────────────
-    # ZeroFSDPPass annotates g.metadata["zero"] with weight/grad/optstate shard
-    # factors; TrainingMemoryPass consumes these downstream.
-    pipe.add("optim", ZeroFSDPPass(), condition=is_train)
+    pipe.add("optim", ZeroFSDPPass(),        condition=is_train)
 
     # ── Stage 4: Analyze ──────────────────────────────────────────────────────
     pipe.add("analyze", FlopsPass())
     pipe.add("analyze", RooflinePass())
     pipe.add("analyze", CommLatencyPass())
     pipe.add("analyze", StreamAssignPass())
-    # TrainFlopsPass annotates per-node flops_fwd / flops_dx / flops_dw.
-    # TrainingFlopsPass below sums those annotations; 6P is fallback only.
     pipe.add("analyze", TrainFlopsPass(),       condition=is_train)
     pipe.add("analyze", TrainingFlopsPass(),    condition=is_train)
     pipe.add("analyze", TrainingMemoryPass(),   condition=is_train)
     pipe.add("analyze", TrainingPipelinePass(), condition=is_train)
 
     return pipe
+
+
+# backward-compat aliases — callers need not change
+build_default_pipeline = build_pipeline
+build_training_pipeline = build_pipeline

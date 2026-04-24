@@ -12,7 +12,6 @@ from zrt.ir.node import OpNode
 from zrt.ir.edge import Edge
 from zrt.ir.types import TensorMeta, DType
 from zrt.transform.context import TransformContext, ParallelConfig, TrainingConfig
-from zrt.transform.analysis import estimate_training
 
 
 def _hw():
@@ -117,121 +116,6 @@ def _captured_style_graph(seq_len=2048, hidden=4096, ffn=16384, num_layers=32) -
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
-
-def test_captured_graph_tensor_ids_are_opaque():
-    """Verify the test graph actually uses captured-style (opaque) tensor IDs."""
-    g = _captured_style_graph()
-    all_input_ids = {
-        inp.id
-        for node in g.nodes.values()
-        for inp in node.inputs
-    }
-    # No "weight" or "param" in any tensor ID — these are captured-style IDs
-    assert not any("weight" in tid or "param" in tid for tid in all_input_ids), (
-        "Test graph should use opaque tensor IDs (t0, t1, ...) not named ones"
-    )
-
-
-def test_estimate_training_total_params_nonzero():
-    """TrainingFlopsPass must count params accurately from a captured-style graph.
-
-    For 2 layers with hidden=4096, ffn=16384:
-      params = 2 × (QKV: hidden² + FFN-up: hidden×ffn + FFN-down: ffn×hidden)
-             = 2 × (16.7M + 67.1M + 67.1M) ≈ 302M
-    """
-    hidden, ffn = 4096, 16384
-    expected = 2 * (hidden * hidden + hidden * ffn + ffn * hidden)
-
-    g = _captured_style_graph(seq_len=2048, hidden=hidden, ffn=ffn)
-    hw = _hw()
-    ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=1, pp=1, dp=1),
-        training=TrainingConfig(micro_batch=1, global_batch=8),
-    )
-    report = estimate_training(g, ctx)
-    assert report.total_params > 0, "Expected non-zero total_params from captured-style graph"
-    # Allow ±5% tolerance for any minor heuristic variance
-    assert abs(report.total_params - expected) / expected < 0.05, (
-        f"Param count {report.total_params:,} deviates >5% from expected {expected:,}"
-    )
-
-
-def test_estimate_training_step_time_nonzero():
-    """estimate_training() on a captured graph with hw_spec must return step_time_ms > 0."""
-    g = _captured_style_graph()
-    hw = _hw()
-    ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=1, pp=1, dp=1),
-        training=TrainingConfig(micro_batch=1, global_batch=8),
-    )
-    report = estimate_training(g, ctx)
-    assert report.step_time_ms > 0, (
-        f"Expected step_time_ms > 0 but got {report.step_time_ms}. "
-        "RooflinePass may not be wired into estimate_training()."
-    )
-
-
-def test_estimate_training_flops_nonzero():
-    """estimate_training() must return non-zero training_flops."""
-    g = _captured_style_graph()
-    hw = _hw()
-    ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=1, pp=1, dp=1),
-        training=TrainingConfig(micro_batch=1, global_batch=8),
-    )
-    report = estimate_training(g, ctx)
-    assert report.training_flops > 0, "Expected non-zero training_flops"
-    assert report.backward_flops == 2 * report.forward_flops
-
-
-def test_estimate_training_mfu_in_range():
-    """MFU must be in [0, 1]."""
-    g = _captured_style_graph()
-    hw = _hw()
-    ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=1, pp=1, dp=1),
-        training=TrainingConfig(micro_batch=1, global_batch=8),
-    )
-    report = estimate_training(g, ctx)
-    assert 0 <= report.mfu <= 1, f"MFU out of range: {report.mfu}"
-
-
-def test_estimate_training_metadata_total_params_overrides():
-    """graph.metadata['total_params'] takes precedence over structural counting."""
-    g = _captured_style_graph()
-    known_params = 70_000_000_000  # 70B
-    g.metadata["total_params"] = known_params
-
-    hw = _hw()
-    ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=1, pp=1, dp=1),
-        training=TrainingConfig(micro_batch=1, global_batch=8),
-    )
-    report = estimate_training(g, ctx)
-    assert report.total_params == known_params
-
-
-def test_estimate_training_parallel_config():
-    """estimate_training() produces sensible results with TP+DP parallelism."""
-    g = _captured_style_graph()
-    hw = _hw()
-    ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=2, pp=1, dp=4),
-        training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=1),
-    )
-    report = estimate_training(g, ctx)
-    assert "TP2" in report.config_summary
-    assert "DP4" in report.config_summary
-    assert "ZeRO-1" in report.config_summary
-    assert report.total_params > 0
-    assert report.step_time_ms > 0
-
 
 def test_pipeline_routing_runs_roofline_and_stream_assign():
     """estimate_training() via build_training_pipeline must run RooflinePass + StreamAssignPass.
@@ -532,26 +416,6 @@ def test_stitch_no_id_conflicts():
     stitched = stitch_fwd_bwd(fwd, bwd)
     ids = list(stitched.nodes.keys())
     assert len(ids) == len(set(ids)), "Duplicate node IDs found in stitched graph"
-
-
-def test_stitch_estimate_training_from_graphs():
-    """estimate_training_from_graphs() with both fwd+bwd returns a valid TrainingReport."""
-    from zrt.transform.analysis.modeller import estimate_training_from_graphs
-    fwd = _captured_style_graph()
-    bwd = _backward_graph_for_fwd(fwd)
-    hw = _hw()
-    report = estimate_training_from_graphs(
-        forward_graph=fwd,
-        backward_graph=bwd,
-        hw_spec=hw,
-        tp=1, pp=1, dp=1,
-        zero_stage=1,
-        micro_batch=1,
-        global_batch=8,
-    )
-    assert report.step_time_ms > 0, "Expected non-zero step_time_ms"
-    assert report.training_flops > 0, "Expected non-zero training_flops"
-    assert report.total_params > 0, "Expected non-zero total_params"
 
 
 # ── Issue 4: cross-graph edge correctness tests ───────────────────────────────

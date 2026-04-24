@@ -4,12 +4,14 @@ Usage::
 
     python -m python.zrt <model_id> [options]
     python -m python.zrt.graph.main <model_id> [options]  # backward compat
+    python -m python.zrt --estimate-config <yaml>         # spec-based estimation
 
 Examples::
 
     python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4
     python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
     python -m python.zrt hf_models/llama3_8b --train --layers 2
+    python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml
 """
 from __future__ import annotations
 
@@ -31,6 +33,17 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Trace LLM operator sequences and write Excel + computation graph.")
+    parser.add_argument(
+        "--estimate-config",
+        metavar="YAML",
+        help="Run spec-based training estimation from a YAML config (no graph capture). "
+             "Example: --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="FILE",
+        help="Write estimation result as JSON to FILE (used with --estimate-config).",
+    )
     parser.add_argument(
         "model_id", nargs="?",
         help="HF Hub model ID or local directory (e.g. deepseek-ai/DeepSeek-V3-0324)")
@@ -151,6 +164,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.estimate_config:
+        _run_estimate(args.estimate_config, args.output)
+        return
+
     # Resolve model_id
     if args.model_id:
         model_id = args.model_id
@@ -258,9 +275,9 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
 def _run_training_modelling(args, model_id: str, hw, result) -> None:
     """Run the full training pipeline: transform → schedule → simulate → report → export."""
     from python.zrt.transform import (
-        build_default_pipeline, TransformContext,
+        build_training_pipeline, TransformContext,
         ParallelConfig, StreamConfig,
-        TrainingMemoryPass, export_training_graphs,
+        export_training_graphs,
     )
     from python.zrt.transform.context import TrainingConfig
     from python.zrt.executor import DAGScheduler
@@ -296,7 +313,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
             global_batch=args.global_batch,
         ),
     )
-    pipe = build_default_pipeline()
+    pipe = build_training_pipeline()
     scheduler = DAGScheduler(hw_spec=hw)
     hub = SimulatorHub.default()
 
@@ -318,20 +335,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         bwd_tl = fwd_tl
         bwd_sim = {}
 
-    # Memory estimation
-    mem_ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=args.tp, cp=cp, ep=args.ep, pp=args.pp, dp=args.dp),
-        stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
-        training=TrainingConfig(
-            optimizer=args.optimizer,
-            zero_stage=args.zero_stage,
-            micro_batch=args.micro_batch,
-            global_batch=args.global_batch,
-        ),
-    )
-    fwd_with_mem = TrainingMemoryPass().run(fwd_transformed, mem_ctx)
-    mem_bd = fwd_with_mem.metadata.get("memory_breakdown")
+    mem_bd = fwd_transformed.metadata.get("memory_breakdown")
 
     summary = build_training_summary(
         model            = model_id,
@@ -371,6 +375,22 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
             print(f"  JSON bwd: {export_result['json_bwd']}")
         except Exception as exc:
             logger.warning("Export failed: %s", exc)
+
+
+def _run_estimate(config_path: str, output_path: str | None) -> None:
+    """Run spec-based training estimation from a YAML config."""
+    from python.zrt.training.io.config_loader import load_specs
+    from python.zrt.training.search.estimator import estimate
+    from python.zrt.training.search.report import report_summary, report_to_json
+
+    model, system, strategy = load_specs(config_path)
+    report = estimate(model, system, strategy)
+
+    if output_path:
+        report_to_json(report, output_path)
+        print(f"Report written to {output_path}")
+    else:
+        print(report_summary(report))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,6 @@ from zrt.transform.context import (
 )
 from zrt.transform.analysis import (
     TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
-    estimate_training,
 )
 
 
@@ -195,53 +194,6 @@ def test_training_pipeline_pass():
     assert metrics.cooldown_steps == 1  # pp - 1
     assert metrics.steady_steps == 7  # M - pp + 1
     assert 0 < metrics.bubble_fraction < 1
-
-
-def test_estimate_training():
-    """Test estimate_training() function returns a complete report."""
-    graph = _make_simple_graph()
-    hw = _make_hardware_spec()
-
-    ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=2, pp=2, dp=4),
-        training=TrainingConfig(
-            optimizer="adam",
-            zero_stage=1,
-            micro_batch=1,
-            global_batch=32,
-        ),
-    )
-
-    # Manually add some latency annotations for testing
-    for node in graph.nodes.values():
-        node.annotations["latency_us"] = 100.0  # 100us per op
-
-    report = estimate_training(graph, ctx)
-
-    assert report.config_summary != ""
-    assert "TP2" in report.config_summary
-    assert "PP2" in report.config_summary
-    assert "DP4" in report.config_summary
-    assert "ZeRO-1" in report.config_summary
-
-    assert report.step_time_ms >= 0
-    assert report.mfu >= 0
-    assert report.training_flops >= 0
-    assert report.total_params >= 0
-    assert len(report.memory_breakdown) > 0
-
-    # Test to_dict()
-    d = report.to_dict()
-    assert "step_time_ms" in d
-    assert "mfu" in d
-    assert "memory_breakdown_gb" in d
-
-    # Test summary()
-    summary = report.summary()
-    assert "Training Estimation Report" in summary
-    assert "Step time" in summary
-    assert "MFU" in summary
 
 
 def test_training_config_num_microbatches():

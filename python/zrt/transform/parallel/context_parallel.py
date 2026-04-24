@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from zrt.ir.graph import OpGraph
-from zrt.transform.base import GraphPass
-from zrt.transform.context import TransformContext
+from python.zrt.ir.graph import OpGraph
+from python.zrt.transform.base import GraphPass
+from python.zrt.transform.context import TransformContext
 
 
 class ContextParallelPass(GraphPass):
@@ -94,5 +94,4 @@ class ContextParallelPass(GraphPass):
         )
 
 
-# Import OpNode here to avoid circular import
-from zrt.ir.node import OpNode
+from python.zrt.ir.node import OpNode

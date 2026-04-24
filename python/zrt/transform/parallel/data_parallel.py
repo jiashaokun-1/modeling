@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from zrt.ir.graph import OpGraph
-from zrt.ir.node import OpNode
-from zrt.transform.base import GraphPass
-from zrt.transform.context import TransformContext
+from python.zrt.ir.graph import OpGraph
+from python.zrt.ir.node import OpNode
+from python.zrt.transform.base import GraphPass
+from python.zrt.transform.context import TransformContext
 
 
 class DataParallelPass(GraphPass):
@@ -53,6 +53,10 @@ class DataParallelPass(GraphPass):
         )
         
         comm_node.annotations["inserted_by"] = "data_parallel_pass"
+        comm_node.annotations["dp_comm"] = True
+        dp_overlap = getattr(ctx.training, "dp_overlap_in_bubble", True) if ctx.training else False
+        if dp_overlap:
+            comm_node.annotations["overlap_in_bubble"] = True
         
         # 4. Append the communication node at the end of the graph
         self._append_at_end(g, comm_node)
@@ -75,7 +79,7 @@ class DataParallelPass(GraphPass):
             if "grad" in node.op_type.lower() or "backward" in node.op_type.lower():
                 # Add output tensor sizes
                 for output in node.outputs:
-                    grad_bytes += output.memory_bytes
+                    grad_bytes += output.mem_bytes
         
         return grad_bytes
 
@@ -104,7 +108,7 @@ class DataParallelPass(GraphPass):
                 # Use the first output of the end node as input to the new node
                 if end_node.outputs:
                     # Create a new edge
-                    from zrt.ir.edge import Edge
+                    from python.zrt.ir.edge import Edge
                     edge = Edge(
                         src=end_node.id,
                         src_idx=0,

@@ -83,6 +83,12 @@ class TrainingConfig:
     # the number of traced transformer layers.  None → greedy bin-packing.
     pp_layer_assignment: list[int] | None = None
 
+    # Context parallel strategy
+    cp_kind: str = "ulysses"  # "ulysses", "ring", "hybrid", "none"
+
+    # Overlap DP allreduce with PP bubble window
+    dp_overlap_in_bubble: bool = True
+
     @property
     def num_microbatches(self) -> int:
         return self.global_batch // self.micro_batch
@@ -99,3 +105,7 @@ class TransformContext:
     phase:        str             = "prefill"
     profile:      Any             = None   # ModelProfile (optional)
     stack:        Any             = None   # SoftwareStack (optional)
+
+    @property
+    def is_training(self) -> bool:
+        return self.training is not None

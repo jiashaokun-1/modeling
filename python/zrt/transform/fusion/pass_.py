@@ -243,7 +243,25 @@ def _fused_node(
     first      = group[0]
     mc         = path_to_class.get(first.scope, first.module_class)
     fused_from = list(dict.fromkeys(n.op_type for n in group))
-    return OpNode(
+
+    # Propagate invariant annotations from source group.
+    # Fusion must not cross stage or phase boundaries — mixed values indicate
+    # a bug in pass ordering.  Log loudly so it surfaces in CI.
+    import logging as _logging
+    _fused_logger = _logging.getLogger(__name__)
+    propagated: dict[str, object] = {}
+    for key in ("stage_id", "phase"):
+        vals = {n.annotations.get(key) for n in group if key in n.annotations}
+        if len(vals) == 1:
+            propagated[key] = vals.pop()
+        elif len(vals) > 1:
+            _fused_logger.error(
+                "_fused_node: group %r has mixed %r values %r — "
+                "fusion is crossing a %s boundary; annotation will be dropped.",
+                fused_id, key, vals, key,
+            )
+
+    node = OpNode(
         id           = fused_id,
         op_type      = label,
         inputs       = inputs,
@@ -257,6 +275,8 @@ def _fused_node(
         num_sub_ops  = len(group),
         fusion_level = level,
     )
+    node.annotations.update(propagated)
+    return node
 
 
 # ── FusionPass ────────────────────────────────────────────────────────────────

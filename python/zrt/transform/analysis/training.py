@@ -257,23 +257,50 @@ class TrainingPipelinePass(GraphPass):
                 sid = node.annotations.get("stage_id", 0)
                 stage_node_sets.setdefault(sid, set()).add(node.id)
 
-            stage_latencies: dict[int, float] = {}
+            stage_fwd: dict[int, float] = {}
+            stage_bwd: dict[int, float] = {}
             for s_id in range(pp):
                 node_ids = stage_node_sets.get(s_id, set())
                 if not node_ids:
-                    stage_latencies[s_id] = 0.0
+                    stage_fwd[s_id] = 0.0
+                    stage_bwd[s_id] = 0.0
                     continue
                 sub = g.subgraph(node_ids)
                 tl = sched.schedule(sub)
-                lat = tl.total_latency_us
+                fwd = tl.phase_latency("fwd")
+                bwd = tl.phase_latency("bwd")
+                # If no phase annotations, fall back to total latency as fwd
+                if fwd == 0.0 and bwd == 0.0:
+                    fwd = tl.total_latency_us
                 if layer_scale != 1.0:
-                    lat *= layer_scale
-                stage_latencies[s_id] = lat
+                    fwd *= layer_scale
+                    bwd *= layer_scale
+                stage_fwd[s_id] = fwd
+                stage_bwd[s_id] = bwd
 
-            g.metadata["stage_timelines_fwd"] = dict(stage_latencies)
+            g.metadata["stage_timelines_fwd"] = dict(stage_fwd)
+            g.metadata["stage_timelines_bwd"] = dict(stage_bwd)
 
-            # Bottleneck stage (max per-stage fwd latency)
-            per_stage_us = max(stage_latencies.values(), default=0.0)
+            # Heterogeneous 1F1B when both fwd and bwd are populated
+            if pp > 1 and stage_fwd and stage_bwd and any(v > 0 for v in stage_bwd.values()):
+                t_fwd_0 = stage_fwd.get(0, 0.0)
+                t_bwd_last = stage_bwd.get(pp - 1, 0.0)
+                t_stage = max(stage_fwd[s] + stage_bwd[s] for s in range(pp))
+                step_time_us = (
+                    (pp - 1) * t_fwd_0
+                    + num_microbatches * t_stage
+                    + (pp - 1) * t_bwd_last
+                )
+                t_stage_avg = sum(stage_fwd[s] + stage_bwd[s] for s in range(pp)) / pp
+                bubble_us = 2 * (pp - 1) * t_stage_avg
+                bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
+                per_stage_us = t_stage
+            else:
+                # Homogeneous fallback
+                per_stage_us = max(stage_fwd.values(), default=0.0)
+                effective_steps = num_microbatches + pp - 1
+                step_time_us = per_stage_us * effective_steps
+                bubble_fraction = (pp - 1) / effective_steps if effective_steps > 0 else 0.0
         else:
             # pp=1 (or stage_id not yet annotated): whole graph is scheduled as one
             # unit. total_latency_us covers all pp stages linearly, so divide by pp.
@@ -282,20 +309,16 @@ class TrainingPipelinePass(GraphPass):
             if layer_scale != 1.0:
                 per_stage_us *= layer_scale
 
-        # 1F1B schedule formulas (standard):
-        #   step_time = (M + pp - 1) * t_stage
-        #   bubble     = (pp - 1) / (M + pp - 1)
-        #   steady_steps = M  (the M back-to-back 1F1B microbatches)
+            effective_steps = num_microbatches + pp - 1
+            step_time_us = per_stage_us * effective_steps
+            bubble_fraction = (pp - 1) / effective_steps if effective_steps > 0 else 0.0
+
+        # 1F1B schedule constants
         warmup_steps = max(0, pp - 1)
         cooldown_steps = max(0, pp - 1)
         steady_steps = max(0, num_microbatches - pp + 1)
-        effective_steps = num_microbatches + pp - 1
-
-        step_time_us = per_stage_us * effective_steps
         step_time_ms = step_time_us / 1000.0
         per_stage_ms = per_stage_us / 1000.0
-
-        bubble_fraction = (pp - 1) / effective_steps if effective_steps > 0 else 0.0
 
         training_flops = g.metadata.get("training_flops", 0.0)
         world_size = ctx.parallel.total_devices if ctx.parallel else 1

@@ -307,12 +307,19 @@ def estimate_training_from_graphs(
     if "unified" in results:
         g = results["unified"]
         pipeline_metrics = g.metadata.get("pipeline_metrics")
-        per_stage_ms = pipeline_metrics.per_stage_ms if pipeline_metrics else 0.0
         memory_breakdown = g.metadata.get("memory_breakdown")
         training_flops = g.metadata.get("training_flops", 0.0)
         forward_flops = g.metadata.get("forward_flops", 0.0)
         backward_flops = g.metadata.get("backward_flops", 0.0)
         total_params = g.metadata.get("total_params", 0)
+
+        # Unified path: Pass already computed step-time with 1F1B formula
+        step_time_ms    = pipeline_metrics.step_time_ms    if pipeline_metrics else 0.0
+        per_stage_ms    = pipeline_metrics.per_stage_ms    if pipeline_metrics else 0.0
+        bubble_fraction = pipeline_metrics.bubble_fraction if pipeline_metrics else 0.0
+        warmup_steps    = pipeline_metrics.warmup_steps    if pipeline_metrics else 0
+        cooldown_steps  = pipeline_metrics.cooldown_steps  if pipeline_metrics else 0
+        steady_steps    = pipeline_metrics.steady_steps    if pipeline_metrics else 0
     else:
         fwd = results["train_forward"]
         fwd_metrics = fwd.metadata.get("pipeline_metrics")
@@ -330,17 +337,15 @@ def estimate_training_from_graphs(
         backward_flops = fwd.metadata.get("backward_flops", 0.0)
         total_params = fwd.metadata.get("total_params", 0)
 
-    # Step time with 1F1B schedule
-    # Correct formula: step = (M + pp - 1) * t_stage
-    pp_val = ctx.parallel.pp
-    num_microbatches = ctx.training.num_microbatches
-    step_time_ms = (num_microbatches + pp_val - 1) * per_stage_ms
-    bubble_time_ms = (pp_val - 1) * per_stage_ms
-    bubble_fraction = bubble_time_ms / step_time_ms if step_time_ms > 0 else 0.0
-
-    warmup_steps = max(0, pp_val - 1)
-    cooldown_steps = max(0, pp_val - 1)
-    steady_steps = num_microbatches
+        # Non-unified path: homogeneous formula
+        pp_val = ctx.parallel.pp
+        num_microbatches = ctx.training.num_microbatches
+        effective_steps = num_microbatches + pp_val - 1
+        step_time_ms = per_stage_ms * effective_steps
+        bubble_fraction = (pp_val - 1) / effective_steps if effective_steps > 0 else 0.0
+        warmup_steps = max(0, pp_val - 1)
+        cooldown_steps = max(0, pp_val - 1)
+        steady_steps = num_microbatches
 
     # MFU
     world_size = ctx.parallel.total_devices

@@ -36,6 +36,7 @@ class ScheduledOp:
     latency_us:  float
     op_type:     str
     category:    str    # "compute" | "communication" | "memory"
+    phase:       str = ""  # "fwd" | "bwd" | ""
 
     def __repr__(self) -> str:
         return (
@@ -86,6 +87,13 @@ class Timeline:
                    - self.total_latency_us)
 
     # ── queries ───────────────────────────────────────────────────────────────
+
+    def phase_latency(self, phase: str) -> float:
+        """Wall-clock latency span of ops matching *phase*."""
+        ops = [op for op in self.scheduled_ops if op.phase == phase]
+        if not ops:
+            return 0.0
+        return max(op.end_us for op in ops) - min(op.start_us for op in ops)
 
     def ops_on_stream(self, stream_id: int) -> list[ScheduledOp]:
         return sorted(
@@ -161,6 +169,7 @@ class DAGScheduler:
                 latency_us  = lat,
                 op_type     = node.op_type,
                 category    = node.category,
+                phase       = node.annotations.get("phase", ""),
             ))
 
         return Timeline(

@@ -156,66 +156,78 @@ class PipelineParallelPass(GraphPass):
 
     def _insert_p2p_nodes(self, graph: "OpGraph",
                           stages: List[LayerGroup]) -> None:
-        """Insert one comm.send_recv node per stage boundary."""
-        topo = graph.topo_sort()
-        topo_rank = {n.id: i for i, n in enumerate(topo)}
+        """Insert comm.send_recv at stage boundaries and rewire receiver edges.
 
-        for i in range(len(stages) - 1):
-            src_stage = stages[i]
-            if not src_stage.node_ids:
-                continue
+        Detects edges that cross stage boundaries (both fwd s→s+1 and bwd
+        s+1→s), inserts one comm node per crossing edge, and rewires
+        receiver-side edges so the comm node is on the real dependency path.
+        """
+        node_stage = {nid: node.annotations.get("stage_id", 0)
+                      for nid, node in graph.nodes.items()}
 
-            # Last node in the sending stage (highest topo rank)
-            valid_src = [nid for nid in src_stage.node_ids if nid in topo_rank]
-            if not valid_src:
-                continue
-            last_src_id = max(valid_src, key=lambda nid: topo_rank[nid])
-            last_src = graph.nodes[last_src_id]
+        # Collect crossing edges (source and dest in different stages)
+        crossing_edges: List[Edge] = []
+        for edge in list(graph.edges):
+            ss = node_stage.get(edge.src, -1)
+            ds = node_stage.get(edge.dst, -1)
+            if ss >= 0 and ds >= 0 and ss != ds:
+                crossing_edges.append(edge)
 
-            # Size of the activation crossing the boundary
-            act_bytes = sum(t.mem_bytes for t in last_src.outputs)
-            if act_bytes == 0:
-                act_bytes = 4  # sentinel for scalar activation
+        p2p_idx = 0
+        for edge in crossing_edges:
+            ss = node_stage[edge.src]
+            ds = node_stage[edge.dst]
+            direction = "fwd" if ds > ss else "bwd"
 
-            # Build output TensorMeta for the received activation
-            if last_src.outputs:
-                ref_out = last_src.outputs[0]
+            tensor = edge.tensor
+            act_bytes = tensor.mem_bytes if tensor else 4
+
+            if tensor:
                 recv_tensor = TensorMeta(
-                    id=f"p2p_act_{i}_{i+1}_0",
-                    shape=ref_out.shape,
-                    dtype=ref_out.dtype,
-                    mem_bytes=ref_out.mem_bytes,
+                    id=f"p2p_{direction}_{ss}_{ds}_{p2p_idx}",
+                    shape=tensor.shape, dtype=tensor.dtype,
+                    mem_bytes=tensor.mem_bytes,
                 )
             else:
                 recv_tensor = TensorMeta.from_shape_dtype(
-                    f"p2p_act_{i}_{i+1}_0", (1,), DType.BF16
+                    f"p2p_{direction}_{ss}_{ds}_{p2p_idx}", (1,), DType.BF16
                 )
 
-            p2p_id = f"comm_p2p_{i}_{i+1}"
+            p2p_id = f"comm_p2p_{direction}_{ss}_{ds}_{p2p_idx}"
+            p2p_idx += 1
+
             p2p_node = OpNode(
                 id=p2p_id,
                 op_type="comm.send_recv",
-                inputs=list(last_src.outputs),
+                inputs=[tensor] if tensor else [],
                 outputs=[recv_tensor],
                 attrs={
-                    "src_stage": i,
-                    "dst_stage": i + 1,
+                    "src_stage": ss,
+                    "dst_stage": ds,
                     "message_size_bytes": act_bytes,
                 },
-                scope=f"pipeline.p2p.stage{i}_to_{i+1}",
+                scope=f"pipeline.p2p.{direction}.stage{ss}_to_{ds}",
                 category="communication",
             )
-            p2p_node.annotations["stage_id"] = i  # belongs to the sending stage
+            p2p_node.annotations["stage_id"] = ss
+            p2p_node.annotations["phase"] = direction
 
-            # Wire: last_src_id → p2p_node
-            p2p_edge = Edge(
-                src=last_src_id,
-                src_idx=0,
-                dst=p2p_id,
-                dst_idx=0,
-                tensor=last_src.outputs[0] if last_src.outputs else None,
-            )
-            graph.insert_after(last_src_id, p2p_node, [p2p_edge])
+            # Insert after source node
+            graph.insert_after(edge.src, p2p_node, [Edge(
+                src=edge.src, src_idx=0,
+                dst=p2p_id, dst_idx=0,
+                tensor=tensor,
+            )])
+
+            # Rewire: remove original crossing edge, add p2p→dst edge
+            if edge in graph.edges:
+                graph.edges.remove(edge)
+            graph.edges.append(Edge(
+                src=p2p_id, src_idx=0,
+                dst=edge.dst, dst_idx=edge.dst_idx,
+                tensor=recv_tensor,
+            ))
+            graph._rebuild_adjacency()
 
     # ── balance check ─────────────────────────────────────────────────────────
 

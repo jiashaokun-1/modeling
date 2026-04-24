@@ -70,7 +70,6 @@ class RooflinePass(GraphPass):
 
             compute_us = (flops / peak  * 1e6) if peak > 0 else 0.0
             memory_us  = (total_b / bw  * 1e6) if bw   > 0 else 0.0
-            latency_us = max(compute_us, memory_us, 1e-3)
 
             ai = flops / total_b if total_b > 0 else math.inf
 
@@ -79,13 +78,13 @@ class RooflinePass(GraphPass):
             else:
                 bound = "latency"
 
-            node.annotations.update({
-                "compute_us":           compute_us,
-                "memory_us":            memory_us,
-                "latency_us":           latency_us,
-                "arithmetic_intensity": ai,
-                "bound":                bound,
-            })
+            node.annotations["compute_us"]           = compute_us
+            node.annotations["memory_us"]            = memory_us
+            node.annotations["arithmetic_intensity"] = ai
+            node.annotations["bound"]                = bound
+            # Respect pre-existing latency_us (e.g. from profiling or test injection)
+            if "latency_us" not in node.annotations:
+                node.annotations["latency_us"] = max(compute_us, memory_us, 1e-3)
 
         return g
 

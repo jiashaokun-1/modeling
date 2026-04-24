@@ -21,8 +21,6 @@ from zrt.training.spec.system import SystemSpec
 class Report:
     step_time_ms: float = 0.0
     mfu: float = 0.0
-    bubble_fraction: float = 0.0
-    schedule_name: str = "1f1b"
     memory: MemBreakdown | None = None
     per_stage: list = field(default_factory=list)
     total_flops: float = 0.0
@@ -65,8 +63,6 @@ def estimate(
     return Report(
         step_time_ms=step_result.step_time * 1000,  # convert to ms
         mfu=step_result.mfu,
-        bubble_fraction=step_result.bubble_fraction,
-        schedule_name=step_result.schedule_name,
         memory=step_result.memory,
         per_stage=step_result.per_stage,
         total_flops=total_flops,

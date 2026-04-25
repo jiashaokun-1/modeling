@@ -44,6 +44,48 @@ def test_attn_core_cost():
     assert cost.dw_flops == 0.0
 
 
+def test_attn_core_cost_uses_model_compression_ratio():
+    """Compressed attention scales fwd and backward attention-core FLOPs."""
+    from zrt.training.ir.graph import Op
+    op = Op(name="test_attn", kind="attn_core", meta={
+        "b": 1, "s": 1024, "heads": 16, "head_dim": 128, "causal": True,
+    })
+    model = ModelSpec(
+        hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
+        head_dim=128, vocab=32000, seq_len=1024,
+        layers=[LayerKind.DENSE],
+        attn_compression_ratio=0.27,
+    )
+
+    cost = op_cost(op, model)
+
+    dense_fwd = 2 * 1 * 1024 * 1024 * 16 * 128
+    expected_fwd = dense_fwd * 0.27
+    assert cost.fwd_flops == pytest.approx(expected_fwd)
+    assert cost.dx_flops == pytest.approx(2.5 * expected_fwd)
+    assert cost.dw_flops == 0.0
+
+
+def test_attn_core_cost_op_ratio_overrides_model_ratio():
+    """Per-op metadata can override a model-level compression ratio."""
+    from zrt.training.ir.graph import Op
+    op = Op(name="test_attn", kind="attn_core", meta={
+        "b": 1, "s": 512, "heads": 8, "head_dim": 128,
+        "causal": True, "attn_compression_ratio": 0.5,
+    })
+    model = ModelSpec(
+        hidden=1024, ffn=4096, num_heads=8, num_kv_heads=8,
+        head_dim=128, vocab=32000, seq_len=512,
+        layers=[LayerKind.DENSE],
+        attn_compression_ratio=0.27,
+    )
+
+    cost = op_cost(op, model)
+
+    dense_fwd = 2 * 1 * 512 * 512 * 8 * 128
+    assert cost.fwd_flops == pytest.approx(dense_fwd * 0.5)
+
+
 def test_memory_bound_cost():
     """Memory-bound ops (ln, softmax, etc.) should have byte traffic."""
     from zrt.training.ir.graph import Op

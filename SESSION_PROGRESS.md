@@ -1,6 +1,6 @@
 # Session Progress
 
-## 当前阶段：P1 ZeroBubble Composer 公式修正 — 已完成
+## 当前阶段：P2 Compressed Attention FLOPs follow-up — 已完成
 
 ## 最新变更（2026-04-25）
 
@@ -16,21 +16,27 @@
 - `t_w` 现在取自同一个 bottleneck stage，而不是全局最大 `bwd_dw`，避免异构 stage 下错误抵扣 bubble。
 - graph-native 路径在缺少 `flops_dw` / stage phase 信息时写 debug log，并退化为“无 dW bubble fill”，避免静默给出误导性 ZeroBubble 结果。
 - 已清理 `TrainingPipelinePass` 与 composer module 的 1F1B-only stale docstring。
+- P2 新增 `ModelSpec.attn_compression_ratio`，默认 1.0，允许 YAML 配置解析；非法值会抛出 `ValueError`。
+- spec 训练路径 `python/zrt/training/models/flops.py::_attn_cost()` 使用 `attn_compression_ratio` 缩放 attention-core forward FLOPs，并同步缩放基于 forward 的 backward dx FLOPs；per-op metadata 可覆盖 model 默认值。
+- graph-native `TrainFlopsPass` 使用 node annotation → node attrs → graph metadata 的优先级读取 `attn_compression_ratio`，缩放 captured attention FLOPs；默认 1.0 保持 dense 行为。
+- `tests/training/test_flops.py` 与 `tests/training/test_transform_integration.py` 增加 compressed attention / override 回归测试。
+- P2 follow-up：graph-native attention 维度推导不再硬编码 `head_dim = 64`；优先读取 node attrs / graph metadata / 4D Q tensor shape，再回退到 hidden/head_dim 推导。
+- `_attn_cost()` 明确注释 backward dx 是从 compressed forward 推导，因此继承 CSA/HCA ratio。
+- graph-native 非法 `attn_compression_ratio` 不再中断整图 pass；现在写出包含 node id 的 warning，并回退到 dense ratio 1.0。
 
 ## 本轮验证
 
 ```
-python -m py_compile python/zrt/training/compose/__init__.py python/zrt/training/compose/stage.py python/zrt/training/compose/pipeline.py python/zrt/transform/analysis/training.py tests/training/test_dualpipe.py tests/training/test_graph_schedule.py
-PYTHONPATH=python pytest tests/training/test_dualpipe.py tests/training/test_graph_schedule.py -q
-PYTHONPATH=python pytest tests/training/test_dualpipe.py tests/training/test_graph_schedule.py tests/training/test_search.py tests/training/test_interleaved_1f1b.py tests/training/test_pipeline_parallel.py -q
-PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py tests/training/test_cli_modeller_wiring.py -q
+python -m py_compile python/zrt/training/spec/model.py python/zrt/training/io/config_loader.py python/zrt/training/models/flops.py python/zrt/transform/analysis/flops_train.py tests/training/test_flops.py tests/training/test_transform_integration.py
+PYTHONPATH=python pytest tests/training/test_flops.py tests/training/test_transform_integration.py -q
+PYTHONPATH=python pytest tests/training/test_flops.py tests/training/test_transform_integration.py tests/training/test_search.py tests/training/test_dualpipe.py tests/training/test_graph_schedule.py -q
 PYTHONPATH=python pytest tests/training -q --ignore=tests/training/anchors
 git diff --check
 ```
 
-结果：focused ZeroBubble/spec/graph tests 17 passed；schedule/search/pipeline regression 44 passed；captured graph + CLI modeller 17 passed；non-anchor training suite 175 passed；`git diff --check` passed。
+结果：focused compressed-attention tests 23 passed；FLOPs/transform/search/schedule regression 42 passed（上一轮）；non-anchor training suite 181 passed；`git diff --check` passed。
 
-已知剩余风险：`tests/training/anchors/test_anchors.py -q` 在上一轮仍为 12 passed / 1 failed，失败为 GPT-3 strict MFU calibration gap（estimated=0.2264，anchor=0.5200，deviation=56.5%）。P1 ZeroBubble 未处理 P2 compressed attention 或 P3 anchor calibration。
+已知剩余风险：`tests/training/anchors/test_anchors.py -q` 在上一轮仍为 12 passed / 1 failed，失败为 GPT-3 strict MFU calibration gap（estimated=0.2264，anchor=0.5200，deviation=56.5%）。P2 未处理 P3 anchor calibration 或 P4 HFU metric。
 
 参考计划：`.omc/plans/proud-wishing-puzzle.md`
 
@@ -40,19 +46,18 @@ git diff --check
 |------|------|------|
 | P0 graph-native path | ✅ 完成 | modeller 恢复、stitch metadata、CLI 接线、step_time 直读 |
 | P1 ZeroBubble Composer | ✅ 完成 | `ZeroBubbleComposer` + graph-native `zb` dispatch |
-| P2 compressed attention | ⏳ 待办 | DeepSeek V4 CSA/HCA FLOPs ratio |
+| P2 compressed attention | ✅ 完成 | `attn_compression_ratio` 接入 spec 与 graph-native attention FLOPs |
 | P3 anchor integration/calibration | ⏳ 待办 | GPT-3 strict MFU gap 仍存在 |
 | P4 HFU metric | ⏳ 待办 | MFU/HFU 区分尚未实现 |
 
 ## 本轮修改文件
 
-- `python/zrt/training/compose/__init__.py`
-- `python/zrt/training/compose/pipeline.py`
-- `python/zrt/training/compose/stage.py`
-- `python/zrt/transform/analysis/training.py`
-- `python/zrt/transform/context.py`
-- `tests/training/test_dualpipe.py`
-- `tests/training/test_graph_schedule.py`
+- `python/zrt/training/spec/model.py`
+- `python/zrt/training/io/config_loader.py`
+- `python/zrt/training/models/flops.py`
+- `python/zrt/transform/analysis/flops_train.py`
+- `tests/training/test_flops.py`
+- `tests/training/test_transform_integration.py`
 - `SESSION_HISTORY.md`
 - `SESSION_PROGRESS.md`
 
@@ -64,3 +69,4 @@ git diff --check
 - Phase 3：`context_parallel.py` / `data_parallel.py` / CoC/MC2 overlap 注解。
 - Phase 4：spec 路径 Composer、Chrome Trace、图路径调度分派、EP 不均衡、搜索/Pareto、Anchor 验证。
 - P1 follow-up：ZeroBubble Composer 已接入 spec 与 graph-native training pipeline。
+- P2 follow-up：Compressed attention FLOPs ratio 已接入 spec 与 graph-native attention cost。

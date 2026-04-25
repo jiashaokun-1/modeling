@@ -759,3 +759,42 @@ Archived at: 2026-04-24
 - `git diff --check`：passed
 
 已知剩余风险：anchor suite 仍保留 GPT-3 strict MFU calibration gap，未在 P1 公式修正中处理。
+
+---
+## 2026-04-25 P2 Compressed Attention FLOPs
+
+### 本轮完成
+
+- `ModelSpec` 新增 `attn_compression_ratio`，默认 1.0，校验范围 `(0, 1]`，并由 YAML config loader 解析。
+- spec 训练 FLOPs 模型在 `attn_core` 上应用 compressed attention ratio，缩放 forward 与基于 forward 推导的 backward dx FLOPs；per-op metadata 可以覆盖 model-level ratio。
+- graph-native `TrainFlopsPass` 支持从 node annotation、node attrs、graph metadata 读取 `attn_compression_ratio`，用于 captured attention FLOPs；默认 dense ratio 1.0 保持兼容。
+- 新增 spec-side 与 graph-native compressed attention 回归测试，覆盖 graph/model 默认值和 per-op/node override。
+
+### 验证
+
+- `python -m py_compile python/zrt/training/spec/model.py python/zrt/training/io/config_loader.py python/zrt/training/models/flops.py python/zrt/transform/analysis/flops_train.py tests/training/test_flops.py tests/training/test_transform_integration.py`
+- `PYTHONPATH=python pytest tests/training/test_flops.py tests/training/test_transform_integration.py -q`：21 passed
+- `PYTHONPATH=python pytest tests/training/test_flops.py tests/training/test_transform_integration.py tests/training/test_search.py tests/training/test_dualpipe.py tests/training/test_graph_schedule.py -q`：42 passed
+- `PYTHONPATH=python pytest tests/training -q --ignore=tests/training/anchors`：179 passed
+- `git diff --check`：passed
+
+已知剩余风险：anchor suite 仍保留 GPT-3 strict MFU calibration gap；P2 未处理 P3 anchor calibration 或 P4 HFU metric。
+
+---
+## 2026-04-25 P2 Compressed Attention follow-up
+
+### 本轮完成
+
+- 修复 graph-native `TrainFlopsPass` attention FLOPs 维度推导：不再硬编码 `head_dim = 64`，改为优先读取 node attrs、graph metadata、4D Q tensor shape，再回退到 hidden/head_dim 推导。
+- 在 spec-side `_attn_cost()` 为 `dx = 2.5 * fwd` 增加注释，明确 backward dx 继承 compressed forward 的 CSA/HCA ratio。
+- graph-native 非法 `attn_compression_ratio` 改为 warning + dense fallback 1.0，warning 包含 node id，避免单个坏 annotation 中断整图 pass。
+- 新增非 64 head_dim 维度推导测试，以及非法 compression ratio warning/fallback 测试。
+
+### 验证
+
+- `python -m py_compile python/zrt/transform/analysis/flops_train.py python/zrt/training/models/flops.py tests/training/test_transform_integration.py`
+- `PYTHONPATH=python pytest tests/training/test_transform_integration.py tests/training/test_flops.py -q`：23 passed
+- `PYTHONPATH=python pytest tests/training -q --ignore=tests/training/anchors`：181 passed
+- `git diff --check`：passed
+
+已知剩余风险：anchor suite 仍保留 GPT-3 strict MFU calibration gap；P2 follow-up 未处理 P3 anchor calibration 或 P4 HFU metric。

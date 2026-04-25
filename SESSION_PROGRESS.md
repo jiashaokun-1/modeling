@@ -1,6 +1,38 @@
 # Session Progress
 
-## 当前阶段：Phase 4 — 已完成
+## 当前阶段：modeller step_time 修复 — 已完成
+
+## 最新变更（2026-04-25）
+
+- 已检查提交 `a4f8c6c6cb5b3ed6f4e23ec6bc0a8794fd11ecd7` 中的 `python/zrt/transform/analysis/modeller.py` 实现。
+- 已恢复图原生训练建模入口：`TrainingReport`、`estimate_training()`、`estimate_training_from_graphs()`、`model_training()`。
+- 已恢复 `python/zrt/transform/analysis/__init__.py` 中的 modeller API 导出。
+- 已在 `python/zrt/ir/adapter.py::stitch_fwd_bwd()` 元数据中补充 `fwd_bwd_stitched=True`，解除 `TrainingMemoryPass` graph-native activation 分支的 metadata gate。
+- 已撤回被中断轮次中对 `python/zrt/training/compose/stage.py` 的无关临时改动。
+- 已修复 `python/zrt/cli.py::_run_training_modelling()` 绕过 modeller 的问题：`--train --hw` 现在调用 `estimate_training_from_graphs()`，由 modeller 执行 graph-native stitch + training pipeline。
+- `estimate_training_from_graphs()` / `model_training()` 新增 `cp` 透传，避免 CLI `--cp` 在恢复后的 graph-native 路径中丢失。
+- 新增 `tests/training/test_cli_modeller_wiring.py`，防止 CLI 退回旧的 forward/backward 分离 pipeline。
+- 已修复 `estimate_training_from_graphs()` 重算 `step_time_ms` 的结构性错误：现在直接读取 `TrainingPipelinePass` 的 `pipeline_metrics.step_time_ms` / `mfu` / bubble 与 warmup/cooldown/steady 指标。
+- `estimate_training_from_graphs()` / `model_training()` 新增 `pp_schedule`、`vpp_chunks` 参数，graph-native modeller 入口可选择 VPP/DualPipe 调度。
+- `tests/training/test_captured_graph_modelling.py` 新增 DualPipe schedule-adjusted step_time 回归测试，防止退回 `(M + pp - 1) * per_stage_ms` 简化公式。
+
+## 本轮验证
+
+```
+python -m py_compile python/zrt/transform/analysis/modeller.py python/zrt/transform/analysis/__init__.py python/zrt/training/compose/stage.py
+PYTHONPATH=python python -c "from python.zrt.transform.analysis import TrainingReport, estimate_training, estimate_training_from_graphs, model_training; print('analysis exports ok')"
+PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py -q
+python -m py_compile python/zrt/cli.py python/zrt/transform/analysis/modeller.py tests/training/test_cli_modeller_wiring.py
+PYTHONPATH=python pytest tests/training/test_cli_modeller_wiring.py -q
+PYTHONPATH=python pytest tests/training/test_graph_schedule.py -q
+python -m py_compile python/zrt/transform/analysis/modeller.py tests/training/test_captured_graph_modelling.py
+PYTHONPATH=python pytest tests/training/test_graph_schedule.py tests/training/test_cli_modeller_wiring.py -q
+PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -q
+```
+
+结果：`test_cli_modeller_wiring.py` 1 passed；`test_captured_graph_modelling.py` 16 passed；`test_graph_schedule.py` 5 passed。
+
+已知剩余风险：`tests/training/anchors/test_anchors.py -q` 目前 12 passed / 1 failed，失败为 GPT-3 strict MFU calibration gap（estimated=0.2264，anchor=0.5200，deviation=56.5%）。本轮修复 graph-native modeller 的 step_time 传播问题，但 spec anchor 校准仍需后续 P3/P2 工作继续处理。
 
 参考计划：`/Users/sky/.claude/plans/based-on-the-above-bright-hopcroft.md`
 补充计划：`/Users/sky/.claude/plans/details-of-the-content-lively-stonebraker.md`

@@ -666,3 +666,53 @@ Archived at: 2026-04-24
 - `tests/training/anchors/`：3 个 YAML + `test_anchors.py`，8 个测试全通过
 
 **全量测试：252 passed, 0 failed**
+
+---
+## 2026-04-25 modeller.py 恢复
+
+### 本轮完成
+
+- 从提交 `a4f8c6c6cb5b3ed6f4e23ec6bc0a8794fd11ecd7` 检查并恢复 `python/zrt/transform/analysis/modeller.py` 的 Phase 0 图原生训练建模入口。
+- 恢复 `python/zrt/transform/analysis/__init__.py` 对 `estimate_training`、`estimate_training_from_graphs`、`model_training`、`TrainingReport` 的导出。
+- `stitch_fwd_bwd()` 元数据补充 `fwd_bwd_stitched=True`，使恢复后的 unified graph 路径可以触发 graph-native activation memory 分支。
+- 放弃被中断轮次里的无关 `StageTime` 临时改动，保持本轮 diff 聚焦在 modeller 恢复。
+
+### 验证
+
+- `python -m py_compile python/zrt/transform/analysis/modeller.py python/zrt/transform/analysis/__init__.py python/zrt/training/compose/stage.py`
+- `PYTHONPATH=python python -c "from python.zrt.transform.analysis import TrainingReport, estimate_training, estimate_training_from_graphs, model_training; print('analysis exports ok')"`
+- `PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py -q`：15 passed
+
+---
+## 2026-04-25 modeller CLI 接线
+
+### 本轮完成
+
+- 修复 `python/zrt/cli.py::_run_training_modelling()` 仍绕过 `modeller.py` 的问题。
+- `--train --hw` 路径现在直接调用 `estimate_training_from_graphs()`，把捕获到的 `train_forward` / `train_backward` 图交给 graph-native bridge，由该 bridge 执行 `stitch_fwd_bwd()` 和训练 pipeline。
+- `estimate_training_from_graphs()` / `model_training()` 增加 `cp` 参数并传入 `ParallelConfig`，避免 CLI `--cp` 在 graph-native 建模路径中丢失。
+- 新增 `tests/training/test_cli_modeller_wiring.py`，用 monkeypatch 锁定 CLI 必须委派到 `estimate_training_from_graphs()`。
+
+### 验证
+
+- `python -m py_compile python/zrt/cli.py python/zrt/transform/analysis/modeller.py tests/training/test_cli_modeller_wiring.py`
+- `PYTHONPATH=python pytest tests/training/test_cli_modeller_wiring.py -q`：1 passed
+- `PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py -q`：15 passed
+- `PYTHONPATH=python pytest tests/training/test_graph_schedule.py -q`：5 passed
+
+---
+## 2026-04-25 modeller step_time 修复
+
+### 本轮完成
+
+- 修复 `estimate_training_from_graphs()` 重新计算 `step_time_ms` 的结构性错误。
+- modeller 现在直接读取 `TrainingPipelinePass` 产出的 `pipeline_metrics.step_time_ms`、`mfu`、`warmup_steps`、`cooldown_steps`、`steady_steps`、`bubble_fraction`，保留 VPP/DualPipe/DP-in-bubble/overlap deduction 等调度修正。
+- `estimate_training_from_graphs()` / `model_training()` 增加 `pp_schedule` 与 `vpp_chunks` 参数，允许 graph-native modeller 入口实际选择 VPP/DualPipe 类 schedule。
+- 新增回归测试覆盖 DualPipe schedule adjustment，确保 modeller 不再退回 `(M + pp - 1) * per_stage_ms` 简化公式。
+
+### 验证
+
+- `python -m py_compile python/zrt/transform/analysis/modeller.py tests/training/test_captured_graph_modelling.py`
+- `PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py -q`：16 passed
+- `PYTHONPATH=python pytest tests/training/test_graph_schedule.py tests/training/test_cli_modeller_wiring.py -q`：6 passed
+- `PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -q`：12 passed, 1 failed（既有 GPT-3 strict MFU calibration gap：estimated=0.2264 vs anchor=0.5200）

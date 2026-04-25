@@ -652,6 +652,7 @@ def stitch_fwd_bwd(
             "bwd_graph_name": bwd_graph.name,
             "fwd_metadata": dict(fwd_graph.metadata),
             "bwd_metadata": dict(bwd_graph.metadata),
+            "fwd_bwd_stitched": True,
         },
     )
 

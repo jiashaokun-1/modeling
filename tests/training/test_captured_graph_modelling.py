@@ -765,6 +765,56 @@ def test_pp_heterogeneous_1f1b_formula():
     )
 
 
+def test_modeller_uses_pipeline_step_time_for_schedule_adjustments():
+    """Graph-native modeller must not recompute away TrainingPipelinePass schedule logic."""
+    import pytest
+    from unittest.mock import MagicMock, patch
+    from zrt.ir.graph import OpGraph
+    from zrt.transform.analysis import estimate_training_from_graphs
+
+    hw = _hw()
+    pp = 4
+    microbatches = 8
+    per_stage_us = 1000.0
+    graph = OpGraph(
+        name="schedule_adjusted",
+        phase="train_forward",
+        metadata={
+            "num_layers": 4,
+            "num_layers_traced": 4,
+            "training_flops": 1e12,
+        },
+    )
+
+    mock_timeline = MagicMock()
+    mock_timeline.total_latency_us = per_stage_us * pp
+    mock_timeline.compute_time_us = mock_timeline.total_latency_us
+    mock_timeline.comm_time_us = 0.0
+    mock_timeline.overlap_us = 0.0
+
+    with patch("python.zrt.executor.scheduler.DAGScheduler") as MockSched:
+        MockSched.return_value.schedule.return_value = mock_timeline
+        report = estimate_training_from_graphs(
+            forward_graph=graph,
+            hw_spec=hw,
+            seq_len=2048,
+            batch_size=1,
+            hidden=4096,
+            num_layers=4,
+            pp=pp,
+            micro_batch=1,
+            global_batch=microbatches,
+            pp_schedule="dualpipe",
+        )
+
+    expected_step_ms = (microbatches * per_stage_us + (pp - 1) * per_stage_us / 2.0) / 1000.0
+    simplified_step_ms = (microbatches + pp - 1) * (per_stage_us / 1000.0)
+    expected_bubble = ((pp - 1) * per_stage_us / 2.0) / (expected_step_ms * 1000.0)
+    assert expected_step_ms != pytest.approx(simplified_step_ms)
+    assert report.step_time_ms == pytest.approx(expected_step_ms)
+    assert report.bubble_fraction == pytest.approx(expected_bubble)
+
+
 # ── Phase 2 end-to-end: stitched pp>1 ─────────────────────────────────────────
 
 def test_pp_routing_basic():

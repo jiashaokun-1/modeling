@@ -1,10 +1,16 @@
 name: deepseek_v3
-description: "DeepSeek-V3 671B MoE, reference, H100 SXM, TP8 EP8 DP32"
+description: "DeepSeek-V3 671B MoE, reference, H100 SXM, TP8 PP1 DP8 (8 nodes). NOTE: EP=1 until Phase-3 EP rank-product policy is resolved."
+model: deepseek_v3
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 512
 config:
   tp: 8
   pp: 1
-  ep: 8
-  dp: 32
+  ep: 1
+  dp: 8
   zero_stage: 1
   micro_batch: 1
   global_batch: 1024

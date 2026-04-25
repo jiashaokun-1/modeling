@@ -364,13 +364,17 @@ def compute_mfu(
     """Model FLOPs Utilization.
 
     MFU = model_flops_per_token * tokens_per_step / (world_size * peak_flops * step_time)
+
+    For MoE models, uses effective_params_for_flops() which accounts for top_k
+    expert sparsity instead of counting all expert parameters.
     """
     if step_time <= 0:
         return 0.0
 
-    # Model FLOPs per token for forward pass: ~6 * P (P = total params)
+    # Model FLOPs per token for forward pass: ~6 * P (P = effective params)
     # Full training step (fwd+bwd): ~6P per token
-    P = model.total_params()
+    # For MoE: effective_params_for_flops() only counts active expert params (top_k/num_experts)
+    P = model.effective_params_for_flops()
     tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
     model_flops = 6.0 * P * tokens  # 6P rule
 

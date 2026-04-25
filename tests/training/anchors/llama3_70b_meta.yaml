@@ -1,5 +1,11 @@
 name: llama3_70b_meta
 description: "LLaMA-3 70B, Meta reference, H100 SXM, TP8 PP1 DP32"
+model: llama3_70b
+system:
+  hw: nvidia_h100_sxm
+  nodes: 32
+  gpus_per_node: 8
+  host_mem_gb: 512
 config:
   tp: 8
   pp: 1

@@ -121,3 +121,62 @@ class ModelSpec:
         lm_head = self.vocab * self.hidden
 
         return embed + layer_params + final_ln + lm_head
+
+    def effective_params_for_flops(self) -> int:
+        """Effective parameters for FLOPs calculation.
+
+        For MoE layers, only top_k/num_experts fraction of expert params
+        are active per token. This is the correct parameter count for
+        the 6P FLOPs rule.
+
+        Dense/MTP layers: 100% of params active
+        MoE layers: shared + router + (top_k/num_experts) * expert_ffn params
+        """
+        # Embedding: vocab * hidden (tied with lm_head by default, count once)
+        embed = self.vocab * self.hidden
+
+        # Final LayerNorm
+        final_ln = self.hidden
+
+        n_dense = sum(1 for lk in self.layers if lk == LayerKind.DENSE)
+        n_moe = sum(1 for lk in self.layers if lk == LayerKind.MOE)
+        n_mtp = sum(1 for lk in self.layers if lk == LayerKind.MTP)
+
+        # Dense and MTP: all params active
+        dense_params = n_dense * self.params_per_dense_layer()
+        mtp_params = n_mtp * self.params_per_mtp_layer()
+
+        # MoE: only active fraction of expert params
+        # Active experts = (top_k / num_experts) fraction of routed experts
+        if n_moe > 0 and self.num_experts > 0 and self.top_k > 0:
+            h = self.hidden
+            h_attn = self.num_heads * self.head_dim
+            h_kv = self.num_kv_heads * self.head_dim
+
+            # Attention params (same as dense, 100% active)
+            attn_params = h * (h_attn + 2 * h_kv) + h_attn * h
+
+            # Router: 100% active (all tokens go through router)
+            router_params = h * self.num_experts
+
+            # Shared expert FFN: 100% active
+            shared_ffn_params = h * self.moe_ffn + h * self.moe_ffn + self.moe_ffn * h
+
+            # Routed experts: only top_k/num_experts fraction active
+            expert_ffn_per_expert = h * self.moe_ffn + h * self.moe_ffn + self.moe_ffn * h
+            active_expert_fraction = self.top_k / self.num_experts
+            expert_ffn_params = expert_ffn_per_expert * self.num_experts * active_expert_fraction
+
+            ln_params = 2 * h
+
+            moe_layer_params = attn_params + router_params + shared_ffn_params + expert_ffn_params + ln_params
+        else:
+            # No MoE or zero experts: fall back to full params
+            moe_layer_params = n_moe * self.params_per_moe_layer()
+
+        layer_params = dense_params + moe_layer_params + mtp_params
+
+        # Count lm_head separately unless tied
+        lm_head = self.vocab * self.hidden
+
+        return embed + layer_params + final_ln + lm_head

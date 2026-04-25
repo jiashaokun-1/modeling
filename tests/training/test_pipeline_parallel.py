@@ -323,3 +323,61 @@ class TestPipelineInDefaultPipeline:
         p2p_nodes = [n for n in result.nodes.values()
                      if n.op_type == "comm.send_recv"]
         assert len(p2p_nodes) == 0
+
+
+# ── Gap 2: VPP/DualPipe on graph-native per-stage path ────────────────────────────
+
+def test_pp_vpp_uses_reduced_bubble():
+    """VPP bubble should be smaller than standard 1F1B on per-stage path.
+
+    This test verifies that the per-stage path (when stage_id annotations exist)
+    correctly applies VPP/DualPipe schedule-type adjustments.
+
+    Gap 2 fix: The per-stage path now applies VPP/DualPipe formulas just like
+    the non-per-stage path, ensuring consistent behavior.
+    """
+    from python.zrt.transform.analysis.training import TrainingFlopsPass
+
+    # Create asymmetric graph (different latencies per layer)
+    graph = _make_linear_graph(num_layers=4)
+    ctx_vpp = _make_ctx(pp=2, global_batch=8)
+    ctx_std = _make_ctx(pp=2, global_batch=8)
+
+    # Set VPP schedule for vpp context
+    ctx_vpp.training = TrainingConfig(
+        micro_batch=1,
+        global_batch=8,
+        pp_schedule="interleaved",
+        vpp_chunks=2,
+    )
+    ctx_std.training = TrainingConfig(
+        micro_batch=1,
+        global_batch=8,
+        pp_schedule="1f1b",
+        vpp_chunks=1,
+    )
+
+    # Apply PP pass to get stage_id annotations
+    g_pp_vpp = PipelineParallelPass().run(graph, ctx_vpp)
+    g_pp_std = PipelineParallelPass().run(graph, ctx_std)
+
+    # Run flops pass and pipeline pass
+    g_vpp = TrainingFlopsPass().run(g_pp_vpp, ctx_vpp)
+    result_vpp = TrainingPipelinePass().run(g_vpp, ctx_vpp)
+
+    g_std = TrainingFlopsPass().run(g_pp_std, ctx_std)
+    result_std = TrainingPipelinePass().run(g_std, ctx_std)
+
+    # Extract metrics
+    bubble_vpp = result_vpp.metadata["pipeline_metrics"].bubble_fraction
+    bubble_std = result_std.metadata["pipeline_metrics"].bubble_fraction
+
+    # VPP bubble should be smaller than standard 1F1B bubble
+    # (VPP splits stages into V virtual chunks, reducing bubble by factor of V)
+    assert bubble_vpp < bubble_std, (
+        f"VPP bubble ({bubble_vpp:.3f}) should be < standard 1F1B bubble ({bubble_std:.3f})"
+    )
+
+    # Verify stage_timelines are present (per-stage path was used)
+    assert "stage_timelines_fwd" in result_vpp.metadata
+    assert "stage_timelines_bwd" in result_vpp.metadata

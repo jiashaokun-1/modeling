@@ -1,5 +1,24 @@
 name: gpt3_175b_megatron
 description: "GPT-3 175B, Megatron-LM reference, H100 SXM, TP8 PP1 DP64"
+model:
+  name: gpt3-175b
+  hidden: 12288
+  ffn: 49152
+  num_heads: 96
+  num_kv_heads: 96
+  head_dim: 128
+  vocab: 50257
+  seq_len: 2048
+  layers: "[dense]*96"
+  param_dtype: bf16
+  grad_dtype: fp32
+  master_dtype: fp32
+  act_dtype: bf16
+system:
+  hw: nvidia_h100_sxm
+  nodes: 64
+  gpus_per_node: 8
+  host_mem_gb: 512
 config:
   tp: 8
   pp: 1

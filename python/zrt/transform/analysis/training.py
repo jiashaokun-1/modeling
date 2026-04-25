@@ -345,13 +345,28 @@ class TrainingPipelinePass(GraphPass):
                 t_fwd_0 = stage_fwd.get(0, 0.0)
                 t_bwd_last = stage_bwd.get(pp - 1, 0.0)
                 t_stage = max(stage_fwd[s] + stage_bwd[s] for s in range(pp))
-                step_time_us = (
-                    (pp - 1) * t_fwd_0
-                    + num_microbatches * t_stage
-                    + (pp - 1) * t_bwd_last
-                )
-                t_stage_avg = sum(stage_fwd[s] + stage_bwd[s] for s in range(pp)) / pp
-                bubble_us = (pp - 1) * t_stage_avg
+
+                # Apply VPP/DualPipe schedule-type adjustments to per-stage path
+                pp_schedule = (ctx.training.pp_schedule if ctx.training else "1f1b")
+                V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
+
+                if pp_schedule == "interleaved" and V > 1:
+                    # VPP: warmup/cooldown reduced by V virtual stages
+                    warmup = (pp - 1) * t_fwd_0 / V
+                    cooldown = (pp - 1) * t_bwd_last / V
+                elif pp_schedule == "dualpipev" and V > 1:
+                    # DualPipeV: warmup=cooldown, both reduced by 2V
+                    warmup = cooldown = (pp - 1) * t_stage / (2.0 * V)
+                elif pp_schedule == "dualpipe":
+                    # DualPipe: warmup=cooldown, reduced by 2
+                    warmup = cooldown = (pp - 1) * t_stage / 2.0
+                else:
+                    # Standard 1F1B
+                    warmup = (pp - 1) * t_fwd_0
+                    cooldown = (pp - 1) * t_bwd_last
+
+                step_time_us = warmup + num_microbatches * t_stage + cooldown
+                bubble_us = warmup + cooldown
                 bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
                 per_stage_us = t_stage
             else:

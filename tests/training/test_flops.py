@@ -95,3 +95,53 @@ def test_unknown_op_zero_cost():
     cost = op_cost(op, model)
     assert cost.fwd_flops == 0.0
     assert cost.dx_flops == 0.0
+
+
+def test_moe_effective_params_is_sane():
+    """MoE effective params should be less than total params when top_k < num_experts."""
+    from zrt.training.spec.system import GPU, NetTier, SystemSpec
+    from zrt.training.spec.strategy import Strategy
+    from zrt.training.compose.pipeline import compute_mfu
+
+    # Minimal MoE model: 2 layers, 4 experts, top_k=1
+    model = ModelSpec(
+        hidden=4096, ffn=2048, num_heads=32, num_kv_heads=32,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.MOE] * 2,
+        num_experts=4, moe_ffn=1024, top_k=1,
+    )
+
+    total = model.total_params()
+    effective = model.effective_params_for_flops()
+
+    # Effective should be less than total since only 1/4 of experts active
+    assert effective < total, f"effective={effective}, total={total}"
+    ratio = effective / total
+    # With top_k=1, num_experts=4:
+    # - Attention, router, shared FFN are 100% active
+    # - Only routed experts are sparse (1/4 active)
+    # So ratio should be between 50% (mostly routed experts) and 85% (mostly attention/shared)
+    assert 0.5 < ratio < 0.9, f"effective/total ratio {ratio:.3f} outside expected range for top_k=1, num_experts=4"
+
+
+def test_moe_mfu_is_sane():
+    """MoE MFU should be between 0 and 1, not collapse to 1.0."""
+    from zrt.training.io.config_loader import load_specs
+    from zrt.training.search.estimator import estimate
+
+    # Run estimate on deepseek_v3 config
+    model, system, strategy = load_specs("python/zrt/training/configs/llama3_70b_3d.yaml")
+
+    # Temporarily make it MoE-like for testing
+    from dataclasses import replace
+    model_moe = replace(model,
+        layers=[LayerKind.MOE] * 2,
+        num_experts=4,
+        moe_ffn=1024,
+        top_k=1,
+    )
+
+    report = estimate(model_moe, system, strategy)
+
+    # MFU should be sane: strictly between 0 and 1 (not 0, not 1)
+    assert 0.0 < report.mfu < 1.0, f"MoE MFU collapsed to {report.mfu}, expected 0 < MFU < 1"

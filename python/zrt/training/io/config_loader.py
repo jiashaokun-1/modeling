@@ -29,6 +29,48 @@ def load_specs(config_path: str | Path) -> tuple[ModelSpec, SystemSpec, Strategy
     return model, system, strategy
 
 
+def load_anchor_config(yaml_path: str | Path) -> tuple[ModelSpec, SystemSpec, Strategy]:
+    """Load anchor YAML into ModelSpec, SystemSpec, Strategy.
+
+    Anchor YAMLs have a special structure:
+      - model: reference to model config (e.g., "deepseek-v3") or inline model spec
+      - system: hardware configuration (hw, nodes, gpus_per_node)
+      - config: parallel strategy (tp, cp, pp, ep, dp, etc.)
+
+    Returns (ModelSpec, SystemSpec, Strategy) tuple for use with estimate().
+    """
+    with open(yaml_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    # Parse model (reference or inline)
+    model_ref = cfg.get("model")
+    if isinstance(model_ref, str):
+        # Reference to model config in configs/models/
+        model = _resolve_model(model_ref)
+    elif isinstance(model_ref, dict):
+        # Inline model spec
+        model = _parse_model(model_ref)
+    else:
+        raise ValueError(
+            f"Anchor {yaml_path}: 'model' must be a string (reference) "
+            f"or dict (inline spec), got {type(model_ref)}"
+        )
+
+    # Parse system
+    system_d = cfg.get("system", {})
+    if not system_d:
+        raise ValueError(f"Anchor {yaml_path}: missing 'system' section")
+    system = _parse_system(system_d)
+
+    # Parse strategy from "config" section (anchors use "config" not "strategy")
+    config_d = cfg.get("config", {})
+    if not config_d:
+        raise ValueError(f"Anchor {yaml_path}: missing 'config' section")
+    strategy = _parse_strategy(config_d)
+
+    return model, system, strategy
+
+
 def _resolve_model(model_ref: str | dict) -> ModelSpec:
     if isinstance(model_ref, str):
         path = _MODELS_DIR / f"{model_ref}.yaml"

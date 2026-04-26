@@ -284,6 +284,49 @@ def _make_model_slug(model_id: str) -> str:
     return re.sub(r"[^\w]+", "_", Path(model_id).name).strip("_")
 
 
+def _build_geometry_params(
+    config: Any, batch_size: int, seq_len: int, query_len: int,
+) -> dict[str, int]:
+    """Collect model geometry parameters for shape tagging.
+
+    Extracts architectural constants from the HF config and combines with
+    runtime dimensions.  Fixed values (hidden, ffn, etc.) serve as the
+    reference set for classifying a tensor dimension as static vs variable.
+    """
+    params: dict[str, int] = {
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "query_len": query_len,
+    }
+    # Architectural constants — present in most causal LMs
+    for attr in (
+        "hidden_size", "intermediate_size",
+        "num_attention_heads", "num_key_value_heads",
+        "vocab_size",
+    ):
+        val = getattr(config, attr, None)
+        if val is not None:
+            params[attr] = val
+
+    # Optional MoE fields
+    for attr in ("n_routed_experts", "n_shared_experts",
+                 "moe_intermediate_size", "num_experts_per_tok",
+                 "first_k_dense_replace"):
+        val = getattr(config, attr, None)
+        if val is not None:
+            params[attr] = val
+
+    # Optional MLA / architecture-specific fields
+    for attr in ("q_lora_rank", "kv_lora_rank",
+                 "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim",
+                 "head_dim", "index_head_dim", "index_n_heads", "index_topk"):
+        val = getattr(config, attr, None)
+        if val is not None:
+            params[attr] = val
+
+    return params
+
+
 # ── Internal phase helpers ─────────────────────────────────────────────────────
 
 def _trace_phase(
@@ -362,6 +405,9 @@ def _trace_phase(
             model.gradient_checkpointing_enable()
             logger.info("Gradient checkpointing enabled.")
 
+    # Build geometry params for shape tagging
+    geometry_params = _build_geometry_params(config, batch_size, seq_len, query_len)
+
     tensor_tracker = tensor_tracker or TensorTracker()
     tracker = ModuleTracker(model)
     recorder = RecordingDispatch(
@@ -370,6 +416,7 @@ def _trace_phase(
         skip_reshapes=True,
         active=not is_backward_only,
         target_layers=target_layers,
+        geometry_params=geometry_params,
     )
     try:
         if is_training:

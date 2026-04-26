@@ -33,6 +33,37 @@ def shape_str(t: torch.Tensor) -> str:
     return str(list(t.shape))
 
 
+def tag_dims(shape: tuple[int, ...], batch: int, query_len: int, seq_len: int,
+             fixed_values: set[int]) -> list[int | str]:
+    """Tag each dimension as variable (B/Q/S/BQ/BS) or static (concrete int).
+
+    Variable tags take priority over fixed-value matching.
+    Collision case (e.g. hidden == seq_len): variable wins.
+    """
+    bs = batch * seq_len
+    bq = batch * query_len
+    tags: list[int | str] = []
+    for dim in shape:
+        if dim == bq:
+            tags.append("BQ")
+        elif dim == bs:
+            tags.append("BS")
+        elif dim == query_len:
+            tags.append("Q")
+        elif dim == seq_len:
+            tags.append("S")
+        elif dim == batch:
+            tags.append("B")
+        else:
+            tags.append(dim)
+    return tags
+
+
+def tags_str(tags: list[int | str]) -> str:
+    """Serialize tag list to string for record storage, e.g. '[BQ, 7168]'."""
+    return "[" + ", ".join(str(t) if isinstance(t, int) else t for t in tags) + "]"
+
+
 def collect_tensors(args: tuple, kwargs: dict) -> List[torch.Tensor]:
     tensors = []
     for a in args:

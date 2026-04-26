@@ -186,6 +186,7 @@ def _parse_strategy(d: dict) -> Strategy:
         dualbatch=d.get("dualbatch", False),
         dp_overlap_in_bubble=d.get("dp_overlap_in_bubble", True),
         optimizer=OptKind(d.get("optimizer", "adam")),
+        builtin_model_id=d.get("builtin_model_id"),
     )
 
 

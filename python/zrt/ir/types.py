@@ -152,31 +152,56 @@ class TensorMeta:
     shape: tuple[int, ...]
     dtype: DType
     mem_bytes: int             # pre-computed: product(shape) * dtype.itemsize
+    shape_template: tuple[int | str, ...] | None = None
+    """Dimension-level tags: int for fixed dims, str for variable (B/S/Q/BS/BQ).
+    None means no template (backward-compat with old captures)."""
 
     @classmethod
     def from_shape_dtype(cls, tensor_id: str,
-                         shape: tuple[int, ...], dtype: DType) -> "TensorMeta":
+                         shape: tuple[int, ...], dtype: DType,
+                         shape_template: tuple[int | str, ...] | None = None) -> "TensorMeta":
         return cls(
             id=tensor_id,
             shape=shape,
             dtype=dtype,
             mem_bytes=memory_bytes(shape, dtype),
+            shape_template=shape_template,
         )
 
     @classmethod
     def from_strings(cls, tensor_id: str,
-                     shape_str: str, dtype_str: str) -> "TensorMeta":
+                     shape_str: str, dtype_str: str,
+                     tags_str: str = "") -> "TensorMeta":
         """Construct from the string representations stored in op records."""
         shape = parse_shape(shape_str)
         dtype = dtype_from_torch(dtype_str) if dtype_str else DType.UNKNOWN
-        return cls.from_shape_dtype(tensor_id, shape, dtype)
+        tmpl = _parse_tags(tags_str) if tags_str else None
+        return cls.from_shape_dtype(tensor_id, shape, dtype, tmpl)
 
     def with_shape(self, new_shape: tuple[int, ...]) -> "TensorMeta":
-        return TensorMeta.from_shape_dtype(self.id, new_shape, self.dtype)
+        return TensorMeta.from_shape_dtype(
+            self.id, new_shape, self.dtype, self.shape_template)
 
     def with_dtype(self, new_dtype: DType) -> "TensorMeta":
-        return TensorMeta.from_shape_dtype(self.id, self.shape, new_dtype)
+        return TensorMeta.from_shape_dtype(
+            self.id, self.shape, new_dtype, self.shape_template)
 
     def __repr__(self) -> str:
         shape_str = "×".join(str(d) for d in self.shape) if self.shape else "scalar"
         return f"TensorMeta({self.id}, {shape_str}, {self.dtype.value})"
+
+
+def _parse_tags(s: str) -> tuple[int | str, ...] | None:
+    """Parse a tag string like '[BQ, 7168]' into a tuple of int|str."""
+    s = s.strip()
+    if not s or s == "[]":
+        return None
+    s = s.strip("[]")
+    parts = [p.strip() for p in s.split(",")]
+    result: list[int | str] = []
+    for p in parts:
+        try:
+            result.append(int(p))
+        except ValueError:
+            result.append(p)
+    return tuple(result)

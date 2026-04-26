@@ -31,6 +31,44 @@ class Report:
     schedule_name: str = "1f1b"
 
 
+def _build_from_builtin(
+    model: ModelSpec, strategy: Strategy, warnings: list[str],
+) -> Graph:
+    """Load a pre-captured OpGraph and convert to training.ir.Graph."""
+    from zrt.ir.retemplate import retemplate
+    from zrt.training.builtins import builtin_registry
+    from zrt.training.ir.from_opgraph import aggregate_to_training_ir
+    from zrt.training.ir.shard import ShardPlan, insert_collectives
+
+    try:
+        capture_graph, _meta = builtin_registry.load(
+            strategy.builtin_model_id, phase="train_forward")
+    except FileNotFoundError:
+        # Fallback: try prefill if train_forward not captured
+        warnings.append(
+            f"Built-in model '{strategy.builtin_model_id}' has no train_forward; "
+            f"falling back to prefill"
+        )
+        capture_graph, _meta = builtin_registry.load(
+            strategy.builtin_model_id, phase="prefill")
+
+    # Rebatch / resequence to match current ModelSpec
+    capture_graph = retemplate(
+        capture_graph,
+        batch_size=strategy.micro_batch,
+        seq_len=model.seq_len,
+        query_len=model.seq_len,
+    )
+
+    graph = aggregate_to_training_ir(capture_graph, model)
+
+    # Apply TP/CP/PP/EP sharding and insert collectives — same as build_graph()
+    shard = ShardPlan(strategy)
+    insert_collectives(graph, shard, model)
+
+    return graph
+
+
 def estimate(
     model: ModelSpec, system: SystemSpec, strategy: Strategy,
 ) -> Report:
@@ -42,8 +80,11 @@ def estimate(
     strategy.validate(model, system)
     warnings = ir_validate(model, system, strategy)
 
-    # Build IR
-    graph = build_graph(model, strategy)
+    # Build IR — from built-in model or formulaic template
+    if strategy.builtin_model_id:
+        graph = _build_from_builtin(model, strategy, warnings)
+    else:
+        graph = build_graph(model, strategy)
 
     # Total training FLOPs
     total_flops = total_training_flops(graph, model, strategy)

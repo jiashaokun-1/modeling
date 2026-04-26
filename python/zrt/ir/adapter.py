@@ -61,21 +61,25 @@ def _parse_tensor_list(
     shapes: str,
     dtypes: str,
     use_ids: bool = True,
+    tags:   str = "",
 ) -> list[TensorMeta]:
     """Build a list of TensorMeta from parallel lists of IDs / shape string / dtype string.
 
     ``shapes`` is a comma-separated bracketed string, e.g. "[1, 128], [7168]".
     ``dtypes`` is a comma-separated string, e.g. "torch.bfloat16, torch.bfloat16".
+    ``tags`` is a comma-separated bracketed string, e.g. "[BQ, 7168], [BQ, 7168]".
     """
     shape_parts = split_shape_list(shapes) if shapes else []
     dtype_parts = [s.strip() for s in dtypes.split(",")] if dtypes else []
+    tag_parts = split_shape_list(tags) if tags else []
 
     result: list[TensorMeta] = []
     for i, tid in enumerate(ids):
         shape_s = shape_parts[i] if i < len(shape_parts) else ""
         dtype_s = dtype_parts[i] if i < len(dtype_parts) else ""
+        tag_s = tag_parts[i] if i < len(tag_parts) else ""
         tensor_id = _tid_str(tid) if use_ids else f"slot{i}"
-        result.append(TensorMeta.from_strings(tensor_id, shape_s, dtype_s))
+        result.append(TensorMeta.from_strings(tensor_id, shape_s, dtype_s, tag_s))
     return result
 
 
@@ -128,11 +132,13 @@ def records_to_opgraph(
             rec.get("_input_ids",  []),
             rec.get("input_shapes",  ""),
             rec.get("input_dtypes",  ""),
+            tags=rec.get("input_shape_tags", ""),
         )
         outputs = _parse_tensor_list(
             rec.get("_output_ids", []),
             rec.get("output_shapes", ""),
             rec.get("output_dtypes", ""),
+            tags=rec.get("output_shape_tags", ""),
         )
 
         node = OpNode(

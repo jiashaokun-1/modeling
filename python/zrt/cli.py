@@ -40,6 +40,12 @@ def main() -> None:
              "Example: --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml",
     )
     parser.add_argument(
+        "--capture-builtin",
+        metavar="MODEL_ID",
+        help="Trace all phases and persist as a built-in model. "
+             "Writes JSON/YAML to python/zrt/training/builtins/models/.",
+    )
+    parser.add_argument(
         "--output",
         metavar="FILE",
         help="Write estimation result as JSON to FILE (used with --estimate-config).",
@@ -166,6 +172,10 @@ def main() -> None:
 
     if args.estimate_config:
         _run_estimate(args.estimate_config, args.output)
+        return
+
+    if args.capture_builtin:
+        _run_capture_builtin(args)
         return
 
     # Resolve model_id
@@ -379,6 +389,88 @@ def _run_estimate(config_path: str, output_path: str | None) -> None:
         print(f"Report written to {output_path}")
     else:
         print(report_summary(report))
+
+
+def _run_capture_builtin(args) -> None:
+    """Trace all phases and persist as a built-in model."""
+    import logging
+    import subprocess
+    from pathlib import Path
+
+    from python.zrt.graph.main import (
+        run_trace_phases, _make_model_slug, _MODEL_DIRS, _build_geometry_params,
+    )
+
+    # training/__init__.py uses `from zrt.*` imports that require python/ in sys.path
+    import sys
+    _python_root = str(Path(__file__).parent.parent.parent / "python")
+    _added = _python_root not in sys.path
+    if _added:
+        sys.path.insert(0, _python_root)
+    from zrt.training.builtins.registry import builtin_registry
+
+    logger = logging.getLogger(__name__)
+
+    # Resolve model_id (same logic as main)
+    if args.model_id:
+        model_id = args.model_id
+    elif args.model:
+        model_dir_name = _MODEL_DIRS[args.model]
+        model_id = str(
+            Path(__file__).parent.parent.parent / "hf_models" / model_dir_name)
+    else:
+        print("ERROR: Provide a model_id or --model for --capture-builtin")
+        return
+
+    builtin_id = args.capture_builtin
+    # Capture phases needed for training estimation; skip decode to avoid KV-cache
+    # broadcasting issues with FakeTensorMode on some models.
+    phases_to_capture = ("prefill", "train_forward")
+    print(f"Capturing built-in model '{builtin_id}' from {model_id} "
+          f"(phases: {', '.join(phases_to_capture)}) ...")
+
+    result = run_trace_phases(
+        model_id=model_id,
+        num_layers=args.layers,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        output_dir=args.output_dir,
+        phases=phases_to_capture,
+        target_layers=None,
+        auto_layers=True,
+        platform=args.platform,
+    )
+
+    # Persist each phase's OpGraph
+    saved_phases = []
+    for phase, (raw_graph, _fused_graph) in result.graphs.items():
+        builtin_registry.save_graph(builtin_id, phase, raw_graph)
+        saved_phases.append(phase)
+        print(f"  Saved {phase}: {len(raw_graph.nodes)} nodes, {len(raw_graph.edges)} edges")
+
+    # Compute and persist meta
+    try:
+        git_sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        git_sha = "unknown"
+
+    meta = {
+        "model_id": builtin_id,
+        "captured_with": {
+            "seq_len": args.seq_len,
+            "batch_size": args.batch_size,
+            "num_layers_traced": args.layers,
+        },
+        "phases": saved_phases,
+        "zrt_sim_version": git_sha,
+    }
+    builtin_registry.save_meta(builtin_id, meta)
+    print(f"  Saved meta: {builtin_id}.meta.yaml")
+    print(f"\nBuilt-in model '{builtin_id}' ready at:")
+    print(f"  {Path(__file__).parent / 'training' / 'builtins' / 'models'}")
 
 
 if __name__ == "__main__":

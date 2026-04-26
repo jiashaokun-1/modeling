@@ -62,20 +62,28 @@ from .types import DType, TensorMeta
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tensor_meta_to_dict(t: TensorMeta) -> dict[str, Any]:
-    return {
+    d: dict[str, Any] = {
         "id":        t.id,
         "shape":     list(t.shape),
         "dtype":     t.dtype.value,
         "mem_bytes": t.mem_bytes,
     }
+    if t.shape_template is not None:
+        d["shape_template"] = [
+            s if isinstance(s, str) else s for s in t.shape_template
+        ]
+    return d
 
 
 def tensor_meta_from_dict(d: dict[str, Any]) -> TensorMeta:
+    tmpl_raw = d.get("shape_template")
+    tmpl = tuple(tmpl_raw) if isinstance(tmpl_raw, list) else None
     return TensorMeta(
         id=d["id"],
         shape=tuple(d["shape"]),
         dtype=DType(d["dtype"]),
         mem_bytes=d["mem_bytes"],
+        shape_template=tmpl,
     )
 
 

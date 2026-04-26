@@ -14,6 +14,8 @@ from python.zrt.graph.tensor_utils import (
     collect_tensors,
     collect_output_tensors,
     shape_str,
+    tag_dims,
+    tags_str,
 )
 from python.zrt.graph.tracker import ModuleTracker
 from python.zrt.graph.classifier import extract_layer_idx, classify_component
@@ -105,7 +107,8 @@ class RecordingDispatch(TorchDispatchMode):
                  module_tracker: Optional[ModuleTracker] = None,
                  skip_reshapes: bool = True,
                  active: bool = True,
-                 target_layers: Optional[List[int]] = None):
+                 target_layers: Optional[List[int]] = None,
+                 geometry_params: Optional[dict[str, int]] = None):
         super().__init__()
         self.tensor_tracker = tensor_tracker
         self.records: List[Dict[str, Any]] = []
@@ -114,6 +117,14 @@ class RecordingDispatch(TorchDispatchMode):
         self.active = active
         self._target_layers: Optional[set] = (
             set(target_layers) if target_layers is not None else None
+        )
+        self._geom = geometry_params or {}
+        self._batch = self._geom.get("batch_size", 1)
+        self._seq_len = self._geom.get("seq_len", 0)
+        self._query_len = self._geom.get("query_len", self._seq_len)
+        self._fixed_values: set[int] = set(
+            v for k, v in self._geom.items()
+            if k not in ("batch_size", "seq_len", "query_len")
         )
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
@@ -161,6 +172,18 @@ class RecordingDispatch(TorchDispatchMode):
         output_shapes = [shape_str(t) for t in output_tensors]
         output_dtypes = [str(t.dtype) for t in output_tensors]
 
+        # Shape tagging: classify each dim as variable (B/S/Q/BS/BQ) or fixed (int)
+        if self._geom:
+            input_tags = [tags_str(tag_dims(
+                tuple(t.shape), self._batch, self._query_len, self._seq_len,
+                self._fixed_values)) for t in input_tensors]
+            output_tags = [tags_str(tag_dims(
+                tuple(t.shape), self._batch, self._query_len, self._seq_len,
+                self._fixed_values)) for t in output_tensors]
+        else:
+            input_tags = []
+            output_tags = []
+
         src_file, src_line, src_code, src_func = _capture_call_site()
         extra_args = _collect_extra_args(func, args, kwargs)
         in_recompute = (
@@ -184,6 +207,8 @@ class RecordingDispatch(TorchDispatchMode):
             "input_dtypes": ", ".join(input_dtypes),
             "output_shapes": ", ".join(output_shapes),
             "output_dtypes": ", ".join(output_dtypes),
+            "input_shape_tags": ", ".join(input_tags),
+            "output_shape_tags": ", ".join(output_tags),
             "num_inputs": len(input_tensors),
             "num_outputs": len(output_tensors),
             "_input_ids": input_ids,

@@ -100,6 +100,9 @@ class Strategy:
     # optimizer
     optimizer: OptKind = OptKind.ADAM
 
+    # built-in model library
+    builtin_model_id: str | None = None  # Load from builtins/ instead of build_graph()
+
     def num_microbatches(self) -> int:
         """Number of microbatches per training step."""
         if self.global_batch > 0:

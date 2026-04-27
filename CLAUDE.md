@@ -26,11 +26,16 @@ pytest tests/test_train_trace.py -v
 
 # Run specific test files
 pytest tests/test_transform.py tests/test_executor.py tests/test_simulator.py -v 2>&1 | tail -n 50
+
 # Run training-specific tests
-pytest tests/training/test_captured_graph_modelling.py -v
-pytest tests/training/test_1f1b.py -v
-pytest tests/training/test_graph_schedule.py -v     # PP schedule dispatch (VPP/DualPipe)
-pytest tests/training/anchors/test_anchors.py -v    # MFU anchor regression
+PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py -v
+PYTHONPATH=python pytest tests/training/test_1f1b.py -v
+PYTHONPATH=python pytest tests/training/test_graph_schedule.py -v     # PP schedule dispatch (VPP/DualPipe)
+PYTHONPATH=python pytest tests/training/test_dualpipe.py -v            # DualPipe/DualPipeV composers
+PYTHONPATH=python pytest tests/training/test_stream_overlap.py -v      # CoC/MC2 overlap
+PYTHONPATH=python pytest tests/training/test_chrome_trace.py -v        # Chrome trace export
+PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -v     # MFU anchor regression (YAML fixtures)
+PYTHONPATH=python pytest tests/training/test_anchor.py -v              # AnchorValidator unit tests
 
 # Skip network tests
 pytest tests/test_screenshot_ops.py -v -m "not network"
@@ -48,6 +53,8 @@ PYTHONPATH=python python -m zrt.training estimate --config python/zrt/training/c
 # End-to-end validation
 python e2e_check.py
 ```
+
+> **Note**: Training module commands require `PYTHONPATH=python` because the training subpackage uses `zrt.*` imports rather than `python.zrt.*`.
 
 ## Architecture
 
@@ -75,6 +82,7 @@ Graph Capture → Transform Pipeline → DAGScheduler → Report Generator
 - `fusion/`: fusion passes based on software stack rules
 - `analysis/`: FLOPs, Roofline, communication latency, training modeling (modeller.py, training.py)
 - `optim/`: optimization passes (quant, recomp, EPLB, MTP)
+- `training/`: training-specific graph passes — `RecomputePass` (activation recompute annotation), `OffloadPass`, `OptimizerPass`, `ZeroFSDPPass`
 - Pass order: Parallel split (TP → EP → SP → PP) → Comm insertion → Fusion → Optimization → Analysis
 - Transforms always **clone before mutating** — functional style throughout
 
@@ -90,6 +98,8 @@ Graph Capture → Transform Pipeline → DAGScheduler → Report Generator
 - `python/zrt/ir/`: `OpGraph`, `OpNode`, `OpEdge`, `DType`, `TensorMeta`, `GraphHierarchy` — core IR types
 - `python/zrt/hardware/`: `HardwareSpec`, `hw_registry.load("nvidia_h100_sxm")` — YAML-based configs in `configs/`
 - `python/zrt/memory/`: memory feasibility + peak estimation
+- `python/zrt/layers/`: abstract operator type layer — `OperatorBase` subclasses (mm, attention, comm, activation, embedding, quant, fused, triton) used by simulator backends for cost modeling
+- `python/zrt/policy_model/`: `PolicyModelManager` — dispatches `OpNode` simulation to a registered cost-model policy (`PolicyType`); pluggable via `POLICY_MAP` in `policy_register.py`
 - `python/zrt/report/summary.py`: Excel/HTML report generation; `chrome_trace.py` builds Chrome Trace JSON from a `Timeline`
 - `python/zrt/training/`: training performance estimation — see **Training Module** section below
 
@@ -102,15 +112,18 @@ The training module is self-contained and substantially larger than the rest; it
   - `PPSched`: `ONE_F_ONE_B` / `INTERLEAVED` / `ZERO_BUBBLE` / `DUALPIPE` / `DUALPIPE_V`
   - `CPKind`: `ULYSSES` / `RING` / `HYBRID`
   - `TPOverlap`: `COC` / `MC2`
+  - `OptKind`: `ADAM` / `MUON`
+  - `Strategy.attn_compression_ratio`: scales attention FLOPs for sparse/compressed attention variants
 - `ir/` — training-side `Graph` (layer shards + stage assignment), `builders`, `validate`
-- `models/` — `comm.py` (collective time), `flops.py`, `memory.py` (`MemBreakdown`)
-- `compose/` — `PipelineComposer` ABC + four concrete composers: `OneF1BComposer`, `InterleavedComposer` (VPP), `DualPipeComposer`, `DualPipeVComposer`. Each returns a `StepResult` (step_time, bubble_fraction, mfu, memory).
+- `models/` — `comm.py` (collective time), `flops.py` (`recompute_overhead_flops()` for selective recompute categories), `memory.py` (`MemBreakdown`)
+- `compose/` — `PipelineComposer` ABC + five concrete composers: `OneF1BComposer`, `InterleavedComposer` (VPP), `ZeroBubbleComposer`, `DualPipeComposer`, `DualPipeVComposer`. Each returns a `StepResult` with fields: `step_time`, `bubble_fraction`, `mfu`, `hfu`, `memory`.
+  - **MFU vs HFU**: MFU excludes recompute overhead FLOPs; HFU includes them. `hfu > mfu` whenever selective recompute is active.
 - `search/` — `SearchSpace` (grid over TP/CP/PP/EP/DP/ZeRO/PPSched/vpp_chunks) + `SearchEstimator` → Pareto-front `SearchReport`
 - `anchor/` — `AnchorValidator` reads YAML fixtures from `tests/training/anchors/` and checks MFU within tolerance; used for regression testing
 - `trace/` — `ChromeTraceExporter` converts a `Timeline` into Chrome Trace JSON (loaded via `chrome://tracing`)
 - `io/` — `config_loader.py` (YAML → `ModelSpec`/`Strategy`/`SystemSpec`), `perf_tables.py`
 
-**PP schedule dispatch** (`transform/analysis/training.py:285-298`): `ctx.training.pp_schedule` selects among interleaved/dualpipev/dualpipe/1f1b. The unified path in `modeller.py:307-343` reads `pipeline_metrics.step_time_ms` directly from the chosen composer instead of recomputing.
+**PP schedule dispatch** (`transform/analysis/training.py:285-298`): `ctx.training.pp_schedule` selects among interleaved/dualpipev/dualpipe/zb/1f1b. The unified path in `modeller.py:307-343` reads `pipeline_metrics.step_time_ms` directly from the chosen composer instead of recomputing.
 
 **Anchor YAML fixtures** (`tests/training/anchors/*.yaml`): GPT-3 175B, LLaMA-3 70B, DeepSeek-V3 — each pins expected MFU and step time to guard against regressions. Run with `pytest tests/training/anchors/test_anchors.py`.
 
@@ -160,6 +173,8 @@ Local model configs (no weights) live in `hf_models/` (deepseek_v3, llama3_8b, e
 **Hardware Registry Pattern**: `hw_registry.load(name)` loads YAML configs into `HardwareSpec` objects. Hardware details never hardcode in transform logic.
 
 **Training Memory Estimation**: Training memory calculation uses per-component formulas (weights, gradients, optimizer states, activations) with ZeRO staging (0-3) and gradient checkpointing support.
+
+**Recompute annotation flow**: `RecomputePass` (in `transform/training/recompute.py`) annotates forward-graph nodes with `node.annotations["recompute"] = True` scoped by `layer_kind`. Downstream, `TrainingFlopsPass` extracts `recompute_flops` from these annotations and `compose/pipeline.py::compute_hfu()` uses it to separate MFU from HFU.
 
 ## Design Documentation
 

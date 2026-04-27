@@ -741,7 +741,10 @@ def test_pp_heterogeneous_1f1b_formula():
         f"stage 1 fwd ({stage_fwd.get(1):.1f}µs) — latency injection not working"
     )
 
-    # Heterogeneous spec formula
+    # Heterogeneous spec formula (matches design doc and OneF1BComposer docstring):
+    #   warmup   = (pp - 1) * t_fwd[0]
+    #   steady   = M * max(t_fwd[s] + t_bwd[s])
+    #   cooldown = (pp - 1) * t_bwd[-1]
     M, pp = ctx.training.num_microbatches, 2
     t_fwd_0    = stage_fwd[0]
     t_bwd_last = stage_bwd[1]

@@ -336,33 +336,17 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     except UnicodeEncodeError:
         logger.info("Training summary:\n%s", report.summary())
 
-        # Auto-export HTML + Chrome Trace
-        try:
-            report_dir = output_dir / "reports"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            export_html_report(
-                summary, report_dir / "training_report.html",
-                timeline_data=[
-                    {"start": op.start_us, "end": op.end_us,
-                     "stream": op.stream_id, "type": op.stream_type}
-                    for op in fwd_tl.scheduled_ops
-                ],
-            )
-            export_chrome_trace(
-                fwd_tl, report_dir / "train_forward_trace.json",
-                name=f"{model_id} | train_forward",
-                metadata={"model": model_id, "hardware": args.hw,
-                          "phase": "train_forward", "parallel": parallel_desc},
-            )
-            if raw_bwd is not None:
-                export_chrome_trace(
-                    bwd_tl, report_dir / "train_backward_trace.json",
-                    name=f"{model_id} | train_backward",
-                    metadata={"model": model_id, "hardware": args.hw,
-                              "phase": "train_backward", "parallel": parallel_desc},
-                )
-        except Exception as exc:
-            logger.warning("Report export failed: %s", exc)
+    # Export training report JSON
+    try:
+        import json as _json
+        report_dir = result.output_dir / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        slug = _make_model_slug(model_id)
+        json_path = report_dir / f"{slug}_training_report.json"
+        json_path.write_text(_json.dumps(report.to_dict(), indent=2))
+        logger.info("Training report written to %s", json_path)
+    except Exception as exc:
+        logger.warning("Report export failed: %s", exc)
 
 
 def _run_estimate(config_path: str, output_path: str | None) -> None:

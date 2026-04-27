@@ -9,6 +9,7 @@ from python.zrt.ir.param_count import count_params
 from python.zrt.transform.base import GraphPass
 
 if TYPE_CHECKING:
+    from python.zrt.hardware.spec import HardwareSpec
     from python.zrt.ir.graph import OpGraph
     from python.zrt.transform.context import TransformContext
 
@@ -326,15 +327,17 @@ class TrainingPipelinePass(GraphPass):
         from python.zrt.executor.scheduler import DAGScheduler
         sched = DAGScheduler(hw)
 
+        # Per-stage scheduling state (populated by both branches below)
+        stage_fwd: dict[int, float] = {}
+        stage_bwd: dict[int, float] = {}
+        stage_bwd_dw: dict[int, float] = {}
+
         if pp > 1 and any("stage_id" in n.annotations for n in g.nodes.values()):
             # Per-stage scheduling: schedule each stage's subgraph independently
             stage_node_sets: dict[int, set[str]] = {}
             for node in g.nodes.values():
                 sid = node.annotations.get("stage_id", 0)
                 stage_node_sets.setdefault(sid, set()).add(node.id)
-
-            stage_fwd: dict[int, float] = {}
-            stage_bwd: dict[int, float] = {}
             for s_id in range(pp):
                 node_ids = stage_node_sets.get(s_id, set())
                 if not node_ids:
@@ -356,149 +359,118 @@ class TrainingPipelinePass(GraphPass):
 
             g.metadata["stage_timelines_fwd"] = dict(stage_fwd)
             g.metadata["stage_timelines_bwd"] = dict(stage_bwd)
-            stage_bwd_dw = {
+            stage_bwd_dw.update({
                 s_id: self._estimate_stage_dw_us(
                     g, node_ids, stage_bwd.get(s_id, 0.0),
                     warn_on_missing=False,
                 )
                 for s_id, node_ids in stage_node_sets.items()
-            }
+            })
             for s_id in range(pp):
                 stage_bwd_dw.setdefault(s_id, 0.0)
             g.metadata["stage_timelines_bwd_dw"] = dict(stage_bwd_dw)
 
-            # Heterogeneous 1F1B when both fwd and bwd are populated
-            if pp > 1 and stage_fwd and stage_bwd and any(v > 0 for v in stage_bwd.values()):
-                t_fwd_0 = stage_fwd.get(0, 0.0)
-                t_bwd_last = stage_bwd.get(pp - 1, 0.0)
-                bottleneck_stage = max(
-                    range(pp),
-                    key=lambda s: stage_fwd.get(s, 0.0) + stage_bwd.get(s, 0.0),
-                )
-                t_stage = stage_fwd.get(bottleneck_stage, 0.0) + stage_bwd.get(bottleneck_stage, 0.0)
-                t_w = stage_bwd_dw.get(bottleneck_stage, 0.0)
-
-                # Apply VPP/DualPipe schedule-type adjustments to per-stage path
-                pp_schedule = (ctx.training.pp_schedule if ctx.training else "1f1b")
-                V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
-
-                if pp_schedule == "interleaved" and V > 1:
-                    # VPP: warmup/cooldown reduced by V virtual stages
-                    warmup = (pp - 1) * t_fwd_0 / V
-                    cooldown = (pp - 1) * t_bwd_last / V
-                elif pp_schedule == "dualpipev" and V > 1:
-                    # DualPipeV: warmup=cooldown, both reduced by 2V
-                    warmup = cooldown = (pp - 1) * t_stage / (2.0 * V)
-                elif pp_schedule == "dualpipe":
-                    # DualPipe: warmup=cooldown, reduced by 2
-                    warmup = cooldown = (pp - 1) * t_stage / 2.0
-                elif pp_schedule in {"zb", "zero_bubble"}:
-                    if t_w <= 0.0:
-                        logger.debug(
-                            "ZeroBubble selected but no flops_dw annotations were "
-                            "available for the bottleneck stage; using no dW bubble fill."
-                        )
-                    # ZeroBubble: dW work fills the remaining pipeline bubble.
-                    bubble = (pp - 1) * max(t_stage - t_w, 0.0)
-                    warmup = cooldown = bubble / 2.0
-                else:
-                    # Standard 1F1B
-                    warmup = (pp - 1) * t_fwd_0
-                    cooldown = (pp - 1) * t_bwd_last
-
-                step_time_us = warmup + num_microbatches * t_stage + cooldown
-                bubble_us = warmup + cooldown
-                bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
-                per_stage_us = t_stage
-            else:
-                # Homogeneous fallback
-                per_stage_us = max(stage_fwd.values(), default=0.0)
-                pp_schedule = (ctx.training.pp_schedule if ctx.training else "1f1b")
-                V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
-
-                if pp_schedule == "interleaved" and V > 1:
-                    bubble_us = (pp - 1) * per_stage_us / V
-                elif pp_schedule == "dualpipev" and V > 1:
-                    bubble_us = (pp - 1) * per_stage_us / (2.0 * V)
-                elif pp_schedule == "dualpipe":
-                    bubble_us = (pp - 1) * per_stage_us / 2.0
-                elif pp_schedule in {"zb", "zero_bubble"}:
-                    bottleneck_stage = max(
-                        range(pp),
-                        key=lambda s: stage_fwd.get(s, 0.0) + stage_bwd.get(s, 0.0),
-                    )
-                    t_w = stage_bwd_dw.get(bottleneck_stage, 0.0)
-                    if t_w <= 0.0:
-                        logger.debug(
-                            "ZeroBubble selected but no flops_dw annotations were "
-                            "available for the bottleneck stage; using no dW bubble fill."
-                        )
-                    bubble_us = (pp - 1) * max(per_stage_us - t_w, 0.0)
-                else:
-                    bubble_us = (pp - 1) * per_stage_us
-
-                step_time_us = num_microbatches * per_stage_us + bubble_us
-                bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
         else:
-            # pp=1 (or stage_id not yet annotated): whole graph is scheduled as one
-            # unit. total_latency_us covers all pp stages linearly, so divide by pp.
-            tl = sched.schedule(g)
-            per_stage_us = tl.total_latency_us / pp
-            if layer_scale != 1.0:
-                per_stage_us *= layer_scale
-
-            # Schedule-type bubble for the non-phase-aware path.
-            # Phase-aware path (pp>1, stage_id present) already computed step_time_us
-            # and bubble_fraction via the heterogeneous/homogeneous formula above.
-            # TODO Phase 3: apply VPP/DualPipe adjustments to the per-stage path too.
-            pp_schedule = (ctx.training.pp_schedule if ctx.training else "1f1b")
-            V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
-
-            if pp_schedule == "interleaved" and V > 1 and pp > 1:
-                bubble_us = (pp - 1) * per_stage_us / V
-            elif pp_schedule == "dualpipev" and pp > 1:
-                bubble_us = (pp - 1) * per_stage_us / (2.0 * max(1, V))
-            elif pp_schedule == "dualpipe" and pp > 1:
-                bubble_us = (pp - 1) * per_stage_us / 2.0
-            elif pp_schedule in {"zb", "zero_bubble"} and pp > 1:
-                logger.debug(
-                    "ZeroBubble selected without stage/phase or flops_dw annotations; "
-                    "using no dW bubble fill."
+            # pp=1 or no stage_id: schedule whole graph as single unit.
+            # When pp > 1 without stage annotations, divide total by pp for
+            # per-stage estimate (homogeneous fallback).
+            if pp > 1:
+                logger.warning(
+                    "PipelineParallelPass has not assigned stage_id annotations; "
+                    "dividing whole-graph latency by pp=%d as homogeneous fallback. "
+                    "Results will ignore real stage heterogeneity and warmup/cooldown "
+                    "structure. Run PipelineParallelPass before this pass for accurate "
+                    "per-stage scheduling.",
+                    pp,
                 )
-                bubble_us = (pp - 1) * per_stage_us
-            else:  # "1f1b" or pp == 1
-                bubble_us = (pp - 1) * per_stage_us
+            tl = sched.schedule(g)
+            _fwd = tl.phase_latency("fwd")
+            _bwd = tl.phase_latency("bwd")
+            fwd = _fwd if isinstance(_fwd, (int, float)) else 0.0
+            bwd = _bwd if isinstance(_bwd, (int, float)) else 0.0
+            if fwd == 0.0 and bwd == 0.0:
+                fwd = tl.total_latency_us
+            if layer_scale != 1.0:
+                fwd *= layer_scale
+                bwd *= layer_scale
+            per_stage_fwd = fwd / pp
+            per_stage_bwd = bwd / pp
+            for s in range(pp):
+                stage_fwd[s] = per_stage_fwd
+                stage_bwd[s] = per_stage_bwd
+                stage_bwd_dw[s] = 0.0
 
-            step_time_us = num_microbatches * per_stage_us + bubble_us
-            bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
+        # ── Delegate to PipelineComposer ──────────────────────────────────
+        from python.zrt.training.compose.stage import StageTime as _StageTime
+        from python.zrt.training.compose.pipeline import (
+            OneF1BComposer, Interleaved1F1BComposer, ZeroBubbleComposer,
+            DualPipeComposer, DualPipeVComposer,
+        )
+        from python.zrt.training.spec.strategy import (
+            Strategy as _Strategy, PPSched, OptKind,
+        )
+
+        _PP_SCHED_MAP = {
+            "1f1b": PPSched.ONE_F_ONE_B,
+            "interleaved": PPSched.INTERLEAVED,
+            "i1f1b": PPSched.INTERLEAVED,
+            "zb": PPSched.ZERO_BUBBLE,
+            "zero_bubble": PPSched.ZERO_BUBBLE,
+            "dualpipe": PPSched.DUALPIPE,
+            "dualpipev": PPSched.DUALPIPE_V,
+        }
+        _COMPOSER_MAP = {
+            "1f1b": OneF1BComposer,
+            "interleaved": Interleaved1F1BComposer,
+            "i1f1b": Interleaved1F1BComposer,
+            "zb": ZeroBubbleComposer,
+            "zero_bubble": ZeroBubbleComposer,
+            "dualpipe": DualPipeComposer,
+            "dualpipev": DualPipeVComposer,
+        }
+        _OPT_MAP = {"adam": OptKind.ADAM, "adamw": OptKind.ADAM, "muon": OptKind.MUON}
+
+        pp_schedule = ctx.training.pp_schedule if ctx.training else "1f1b"
+        opt_str = ctx.training.optimizer if ctx.training else "adam"
+
+        stage_times_list = [
+            _StageTime(
+                fwd=stage_fwd.get(s, 0.0) / 1e6,
+                bwd=stage_bwd.get(s, 0.0) / 1e6,
+                bwd_dw=stage_bwd_dw.get(s, 0.0) / 1e6,
+            )
+            for s in range(pp)
+        ]
+
+        dp_ar_time_s = self._compute_dp_ar_time(g, hw, ctx) / 1e6
+
+        strategy_proxy = _Strategy(
+            tp=ctx.parallel.tp if ctx.parallel else 1,
+            pp=pp,
+            ep=ctx.parallel.ep if ctx.parallel else 1,
+            dp=ctx.parallel.dp if ctx.parallel else 1,
+            cp=getattr(ctx.parallel, "cp", 1) if ctx.parallel else 1,
+            micro_batch=ctx.training.micro_batch if ctx.training else 1,
+            global_batch=ctx.training.global_batch if ctx.training else 32,
+            pp_schedule=_PP_SCHED_MAP.get(pp_schedule, PPSched.ONE_F_ONE_B),
+            vpp_chunks=max(1, ctx.training.vpp_chunks if ctx.training else 1),
+            zero_stage=ctx.training.zero_stage if ctx.training else 0,
+            optimizer=_OPT_MAP.get(opt_str, OptKind.ADAM),
+            dp_overlap_in_bubble=ctx.training.dp_overlap_in_bubble if ctx.training else True,
+        )
+
+        composer_cls = _COMPOSER_MAP.get(pp_schedule, OneF1BComposer)
+        step_result = composer_cls().compose(
+            stage_times_list, num_microbatches, pp, dp_ar_time_s, strategy_proxy
+        )
+
+        step_time_us = step_result.step_time * 1e6
+        per_stage_us = max(
+            (st.fwd + st.bwd) * 1e6 for st in stage_times_list
+        ) if stage_times_list else 0.0
 
         step_time_ms = step_time_us / 1000.0
         per_stage_ms = per_stage_us / 1000.0
-
-        # DP-in-bubble: if DP AR fits inside the bubble window, it is free;
-        # otherwise the exposed portion adds to step time.
-        dp = ctx.parallel.dp if ctx.parallel else 1
-        if dp > 1 and ctx.training and ctx.training.dp_overlap_in_bubble:
-            dp_comm_nodes = [
-                n for n in g.nodes.values()
-                if n.annotations.get("dp_comm") and n.attrs.get("bucket_bytes", 0) > 0
-            ]
-            if dp_comm_nodes:
-                # Prefer latency annotations on comm nodes when available
-                latency_sum = sum(
-                    n.annotations.get("latency_us", 0.0) for n in dp_comm_nodes
-                )
-                if latency_sum > 0.0:
-                    t_dp_ar_us = latency_sum
-                else:
-                    # Fallback: alpha-beta bandwidth formula
-                    bucket_bytes = sum(n.attrs["bucket_bytes"] for n in dp_comm_nodes)
-                    dp_bw_bytes_per_us = hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8 / 1e6
-                    ring_factor = 2.0 * (dp - 1) / dp
-                    t_dp_ar_us = ring_factor * bucket_bytes / dp_bw_bytes_per_us if dp_bw_bytes_per_us > 0 else 0.0
-                t_exposed_dp_us = max(0.0, t_dp_ar_us - bubble_us)
-                step_time_us += t_exposed_dp_us
-                step_time_ms = step_time_us / 1000.0
 
         # Overlap-aware comm time: reduce step_time by hidden comm
         overlap_nodes = [
@@ -543,8 +515,18 @@ class TrainingPipelinePass(GraphPass):
             step_time_us -= hidden_us
             step_time_ms = step_time_us / 1000.0
 
-        warmup_steps = max(0, pp - 1)
-        cooldown_steps = max(0, pp - 1)
+        # Derive warmup/cooldown step counts from schedule semantics
+        _V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
+        if pp_schedule in {"dualpipe", "dualpipev"}:
+            _half = max(1, -(-max(pp - 1, 0) // 2))  # ceil((pp-1)/2)
+            warmup_steps = _half
+            cooldown_steps = _half
+        elif pp_schedule in {"interleaved", "i1f1b"} and _V > 1:
+            warmup_steps = max(1, -(-max(pp - 1, 0) // _V))
+            cooldown_steps = warmup_steps
+        else:
+            warmup_steps = max(0, pp - 1)
+            cooldown_steps = max(0, pp - 1)
         steady_steps = num_microbatches
         training_flops = g.metadata.get("training_flops", 0.0)
         world_size = ctx.parallel.total_devices if ctx.parallel else 1
@@ -569,7 +551,7 @@ class TrainingPipelinePass(GraphPass):
             warmup_steps=warmup_steps,
             cooldown_steps=cooldown_steps,
             steady_steps=steady_steps,
-            bubble_fraction=bubble_fraction,
+            bubble_fraction=step_result.bubble_fraction,
             mfu=min(mfu, 1.0),
             hfu=min(hfu, 1.0),
         )
@@ -610,6 +592,38 @@ class TrainingPipelinePass(GraphPass):
                 )
             return 0.0
         return bwd_us * dw_flops / total_bwd_flops
+
+    @staticmethod
+    def _compute_dp_ar_time(
+        g: "OpGraph", hw: "HardwareSpec", ctx: "TransformContext",
+    ) -> float:
+        """Compute DP allreduce time in microseconds from graph annotations."""
+        dp = ctx.parallel.dp if ctx.parallel else 1
+        if dp <= 1:
+            return 0.0
+
+        dp_comm_nodes = [
+            n for n in g.nodes.values()
+            if n.annotations.get("dp_comm") and n.attrs.get("bucket_bytes", 0) > 0
+        ]
+        if not dp_comm_nodes:
+            return 0.0
+
+        latency_sum = sum(
+            n.annotations.get("latency_us", 0.0) for n in dp_comm_nodes
+        )
+        if latency_sum > 0.0:
+            return latency_sum
+
+        bucket_bytes = sum(n.attrs["bucket_bytes"] for n in dp_comm_nodes)
+        dp_bw_bytes_per_us = (
+            hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8 / 1e6
+        )
+        ring_factor = 2.0 * (dp - 1) / dp
+        return (
+            ring_factor * bucket_bytes / dp_bw_bytes_per_us
+            if dp_bw_bytes_per_us > 0 else 0.0
+        )
 
 
 # ── Exposed comm-time helper ────────────────────────────────────────────────────

@@ -130,7 +130,9 @@ def test_zero_bubble_uses_weight_grad_to_reduce_bubble():
     t_w = 0.01
     expected = M * t_stage + (4 - 1) * (t_stage - t_w)
     assert zb.step_time == pytest.approx(expected, rel=1e-9)
-    assert zb.bubble_fraction < dp.bubble_fraction
+    f1b = OneF1BComposer().compose(st, M, 4, 0.0, _make_strategy(pp=4))
+    assert zb.bubble_fraction < f1b.bubble_fraction
+    assert dp.bubble_fraction < f1b.bubble_fraction
     assert zb.schedule_name == "zb"
 
 

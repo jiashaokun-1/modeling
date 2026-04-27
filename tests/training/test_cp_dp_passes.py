@@ -251,8 +251,9 @@ def test_pipeline_pass_dp_in_bubble_adds_exposed_time():
         result_overlap = TrainingPipelinePass().run(g, ctx_overlap)
         result_no_overlap = TrainingPipelinePass().run(g, ctx_no_overlap)
 
-    # With large DP AR and overlap enabled, step time > no-overlap case
-    assert (result_overlap.metadata["pipeline_metrics"].step_time_ms >=
+    # With dp_overlap=True, composer hides DP AR in bubble → less step time.
+    # With dp_overlap=False, full DP AR is added → more step time.
+    assert (result_overlap.metadata["pipeline_metrics"].step_time_ms <=
             result_no_overlap.metadata["pipeline_metrics"].step_time_ms)
 
 

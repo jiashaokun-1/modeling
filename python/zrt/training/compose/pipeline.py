@@ -87,13 +87,13 @@ class OneF1BComposer(PipelineComposer):
             )
 
         # With pipeline parallelism
-        t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0
-        t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0
+        t_fwd_0 = stage_times[0].fwd if stage_times else 0
+        t_bwd_last = stage_times[-1].bwd if stage_times else 0
         t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
 
-        warmup = (pp - 1) * t_fwd_max
+        warmup = (pp - 1) * t_fwd_0
         steady = M * t_stage_max
-        cooldown = (pp - 1) * t_bwd_max
+        cooldown = (pp - 1) * t_bwd_last
 
         # DP AR: hide in bubble if enabled
         bubble = warmup + cooldown
@@ -193,11 +193,10 @@ class DualPipeComposer(PipelineComposer):
 
         t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
 
-        warmup = (pp - 1) / 2.0 * t_stage_max
+        bubble = (pp - 1) / 2.0 * t_stage_max
+        warmup = bubble / 2.0
+        cooldown = bubble / 2.0
         steady = M * t_stage_max
-        cooldown = (pp - 1) / 2.0 * t_stage_max
-
-        bubble = warmup + cooldown
         dp_exposed = dp_ar_time
         if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
             hidden = min(bubble, dp_ar_time)
@@ -240,11 +239,10 @@ class DualPipeVComposer(PipelineComposer):
 
         t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
 
-        warmup = (pp - 1) / (2.0 * V) * t_stage_max
+        bubble = (pp - 1) / (2.0 * V) * t_stage_max
+        warmup = bubble / 2.0
+        cooldown = bubble / 2.0
         steady = M * t_stage_max
-        cooldown = (pp - 1) / (2.0 * V) * t_stage_max
-
-        bubble = warmup + cooldown
         dp_exposed = dp_ar_time
         if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
             hidden = min(bubble, dp_ar_time)

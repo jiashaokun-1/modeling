@@ -104,6 +104,8 @@ def _parse_model(d: dict) -> ModelSpec:
         top_k=d.get("top_k", 0),
         capacity_factor=d.get("capacity_factor", 1.0),
         expert_imbalance=d.get("expert_imbalance", 0.0),
+        n_group=d.get("n_group", 0),
+        n_shared_experts=d.get("n_shared_experts", 1),
         mtp_depth=d.get("mtp_depth", 0),
         param_dtype=_parse_dtype(d.get("param_dtype", "bf16")),
         grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),

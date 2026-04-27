@@ -99,13 +99,30 @@ def memory_breakdown(
 
 
 def _params_on_rank(model: ModelSpec, strategy: Strategy) -> int:
-    """Total parameters held on one rank after TP + PP sharding."""
-    total = model.total_params()
+    """Total parameters held on one rank after TP + PP + EP sharding."""
+    # Compute dense and MoE params separately for accurate EP sharding
+    dense_params = _dense_params(model)
+    moe_params = _moe_params(model)
 
-    # TP: column-parallel and row-parallel shard params by TP
-    # (roughly half the params in each layer are col-parallel, half row-parallel)
+    total = dense_params + moe_params
+
+    # TP: shard all params by TP
     if strategy.tp > 1:
         total //= strategy.tp
+
+    # EP: shard routed expert params by EP (shared experts NOT sharded by EP)
+    if strategy.ep > 1 and model.num_experts > 0:
+        shared_params = _shared_expert_params(model)
+        routed_params = moe_params - shared_params
+        if strategy.tp > 1:
+            shared_params //= strategy.tp
+            routed_params //= strategy.tp
+        # EP sharding applies to routed experts only
+        routed_after_ep = routed_params // strategy.ep
+        moe_after_tp_ep = shared_params + routed_after_ep
+        # Replace the TP-sharded MoE portion with TP*EP-sharded version
+        moe_after_tp = moe_params // strategy.tp if strategy.tp > 1 else moe_params
+        total = (total - moe_after_tp) + moe_after_tp_ep
 
     # PP: only hold params for layers on this stage
     if strategy.pp > 1:
@@ -118,6 +135,47 @@ def _params_on_rank(model: ModelSpec, strategy: Strategy) -> int:
         total = non_embed + embed_params // strategy.pp
 
     return total
+
+
+def _dense_params(model: ModelSpec) -> int:
+    """Parameters from dense layers only (no MoE experts)."""
+    n_dense = sum(1 for lk in model.layers if lk.value == "dense")
+    n_mtp = sum(1 for lk in model.layers if lk.value == "mtp")
+    # Per dense layer: attn (4 * hidden^2) + FFN (2 * hidden * ffn) + norms/bias
+    attn = 4 * model.hidden * model.hidden
+    ffn = 2 * model.hidden * model.ffn
+    per_dense = attn + ffn + 4 * model.hidden  # norms + biases
+    # Embedding + lm_head (counted once, not per layer)
+    embed = model.vocab * model.hidden * 2
+    return n_dense * per_dense + embed + n_mtp * per_dense
+
+
+def _moe_params(model: ModelSpec) -> int:
+    """Parameters from MoE experts (routed + shared)."""
+    if model.num_experts <= 0:
+        return 0
+    n_moe = sum(1 for lk in model.layers if lk.value == "moe")
+    # Per expert: FFN (2 * hidden * moe_ffn)
+    per_expert = 2 * model.hidden * model.moe_ffn
+    # Shared expert: same as one routed expert
+    n_shared = getattr(model, "n_shared_experts", 1) or 1
+    # Total experts per MoE layer = num_experts + shared experts
+    total_experts_per_layer = model.num_experts + n_shared
+    return n_moe * total_experts_per_layer * per_expert
+
+
+def _shared_expert_params(model: ModelSpec) -> int:
+    """Shared expert parameters (not sharded by EP)."""
+    if model.num_experts <= 0:
+        return 0
+    n_moe = sum(1 for lk in model.layers if lk.value == "moe")
+    per_expert = 2 * model.hidden * model.moe_ffn
+    n_shared = getattr(model, "n_shared_experts", 1) or 1
+    return n_moe * n_shared * per_expert
+
+
+# Also need to store n_shared_experts on ModelSpec for the config loader
+# (already supported via `getattr` default of 1)
 
 
 def _optimizer_state_bytes(P: int, model: ModelSpec, strategy: Strategy) -> int:

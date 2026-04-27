@@ -35,6 +35,8 @@ class ModelSpec:
     top_k: int = 0
     capacity_factor: float = 1.0
     expert_imbalance: float = 0.0
+    n_group: int = 0          # expert routing groups (0 = no group routing)
+    n_shared_experts: int = 1  # shared experts per MoE layer (not sharded by EP)
 
     # MTP
     mtp_depth: int = 0

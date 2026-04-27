@@ -20,14 +20,29 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
-from python.zrt.graph.main import (
-    run_trace_phases,
-    _make_model_slug,
-    _MODEL_DIRS,
-    _PHASE_ALIASES,
-)
-
 logger = logging.getLogger(__name__)
+
+# Lazy imports to avoid requiring torch at module load time
+# These are imported only when needed:
+#   from python.zrt.graph.main import run_trace_phases, _make_model_slug, _MODEL_DIRS, _PHASE_ALIASES
+
+
+def _get_model_dirs():
+    """Lazy import of _MODEL_DIRS to avoid requiring torch at module load time."""
+    from python.zrt.graph.main import _MODEL_DIRS
+    return _MODEL_DIRS
+
+
+def _make_model_slug(model_id: str) -> str:
+    """Lazy import of _make_model_slug to avoid requiring torch at module load time."""
+    from python.zrt.graph.main import _make_model_slug as _impl
+    return _impl(model_id)
+
+
+def _run_trace_phases(**kwargs):
+    """Lazy import of run_trace_phases to avoid requiring torch at module load time."""
+    from python.zrt.graph.main import run_trace_phases
+    return run_trace_phases(**kwargs)
 
 
 def main() -> None:
@@ -48,7 +63,7 @@ def main() -> None:
         "model_id", nargs="?",
         help="HF Hub model ID or local directory (e.g. deepseek-ai/DeepSeek-V3-0324)")
     parser.add_argument(
-        "--model", choices=_MODEL_DIRS.keys(),
+        "--model", choices=_get_model_dirs().keys(),
         help="Shorthand for local DeepSeek model: v3 or v3.2 (backward compat)")
     parser.add_argument("--layers", type=int, default=4,
                         help="Number of transformer layers to trace (default: 4)")
@@ -172,7 +187,7 @@ def main() -> None:
     if args.model_id:
         model_id = args.model_id
     elif args.model:
-        model_dir_name = _MODEL_DIRS[args.model]
+        model_dir_name = _get_model_dirs()[args.model]
         model_id = str(
             Path(__file__).parent.parent.parent / "hf_models" / model_dir_name)
     else:
@@ -200,7 +215,7 @@ def main() -> None:
 
     effective_auto_layers = args.auto_layers or (target_layers is None)
 
-    result = run_trace_phases(
+    result = _run_trace_phases(
         model_id=model_id,
         num_layers=args.layers,
         batch_size=args.batch_size,

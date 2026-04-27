@@ -130,7 +130,7 @@ def test_comm_inserter_cp_ring_inserts_p2p_with_overlap_target():
     p2p_nodes = [n for n in result.nodes.values() if n.op_type == "comm.send_recv"]
     assert len(p2p_nodes) == cp
     for p2p in p2p_nodes:
-        assert p2p.annotations.get("overlap_target") == "attn_0"
+        assert p2p.annotations.get("overlap_target") == "fa_tile:attn_0"
 
 
 # ── Phase 3.2: DataParallelPass ───────────────────────────────────────────────

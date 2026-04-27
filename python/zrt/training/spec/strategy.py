@@ -12,14 +12,10 @@ if TYPE_CHECKING:
 def rank_product(tp: int, cp: int, pp: int, ep: int, dp: int) -> int:
     """Calculate the rank product for a parallel configuration.
 
-    NOTE: This is a phase-3 adaptation point. Currently, EP is treated as
-    "inside" the rank product (i.e., EP does not consume distinct ranks),
-    which matches SearchSpace.strategies() behavior where dp is derived
-    from world_size / (tp * cp * pp * ep).
+    TP * CP * PP * DP = world_size
 
-    Phase-3 decision: If EP dispatch/all-to-all implementation shows that
-    expert parallelism consumes distinct ranks, EP should be added to the
-    product: tp * cp * pp * ep * dp. For now, we follow the current policy.
+    EP (Expert Parallelism) is handled *inside* the existing ranks and
+    does not consume additional distinct ranks.
     """
     return tp * cp * pp * dp
 
@@ -121,7 +117,7 @@ class Strategy:
             errors.append(
                 f"num_heads({model.num_heads}) not divisible by TP({self.tp})"
             )
-        if model.num_kv_heads % self.tp != 0:
+        if model.num_kv_heads % self.tp != 0 and model.num_kv_heads >= self.tp:
             errors.append(
                 f"num_kv_heads({model.num_kv_heads}) not divisible by TP({self.tp})"
             )

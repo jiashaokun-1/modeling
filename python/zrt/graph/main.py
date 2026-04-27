@@ -41,9 +41,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import torch
 
 from python.zrt.graph.dispatch import RecordingDispatch, TensorTracker
-from python.zrt.graph.excel_writer import ExcelWriter
+from python.zrt.report.excel_writer import ExcelWriter
 from python.zrt.graph.graph_builder import build_op_graph, build_fused_op_graph
-from python.zrt.graph.graph_exporter import export_all
+from python.zrt.report.onnx_exporter import export_all
 from python.zrt.graph.model_loader import load_model
 from python.zrt.graph.tracker import ModuleTracker, NullModuleTracker
 from python.zrt.ir.adapter import (

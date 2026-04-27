@@ -314,7 +314,7 @@ report = estimate_training_from_graphs(
 print(report.summary())
 ```
 
-> 也可以使用端到端 API `model_training()`，它内部自动完成抓图 + 建模。详见 `python/zrt/transform/analysis/modeller.py`。
+> 也可以使用 CLI 端到端完成抓图 + 建模：`python -m python.zrt <model> --train --hw <hw>`。详见 `python/zrt/transform/analysis/modeller.py` 中的 `estimate_training_from_graphs()`。
 
 ---
 

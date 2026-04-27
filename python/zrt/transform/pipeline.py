@@ -119,6 +119,4 @@ def build_pipeline() -> TransformPipeline:
     return pipe
 
 
-# backward-compat aliases — callers need not change
 build_default_pipeline = build_pipeline
-build_training_pipeline = build_pipeline

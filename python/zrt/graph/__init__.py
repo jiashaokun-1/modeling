@@ -48,7 +48,7 @@ _MODULE_MAP = {
     "_extract_layer_idx": "python.zrt.graph.classifier",
     "build_op_graph": "python.zrt.graph.graph_builder",
     "build_fused_op_graph": "python.zrt.graph.graph_builder",
-    "export_graphs": "python.zrt.graph.graph_exporter",
+    "export_graphs": "python.zrt.report.onnx_exporter",
     "find_local_fallback": "python.zrt.graph.compat",
     "_LOCAL_REGISTRY": "python.zrt.graph.compat",
 }

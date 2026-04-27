@@ -189,7 +189,7 @@ _2026-04-23。参考文档：`docs/ai_infra_modeller_design.md`。_
 - 标注：`node.annotations["stage_id"] = i`。
 - 在阶段边界插入 `comm.send_recv` P2P 节点（跨阶段边界的激活张量，大小来自 `TensorMeta.mem_bytes`）。
 
-**2.2 —— `estimate_training()` 中的逐阶段调度**
+**2.2 —— `estimate_training_from_graphs()` 中的逐阶段调度**
 - 变换流水线运行完毕后，提取 `pp` 个阶段视图：`[n for n in g.nodes if n.annotations["stage_id"] == s]`。
 - 对每个阶段视图运行 `DAGScheduler` → 每阶段一个 `Timeline`。
 - 从 Timeline 中提取每阶段的 `(t_fwd_us, t_bwd_us)`（按 `node.annotations["phase"]` 拆分）。

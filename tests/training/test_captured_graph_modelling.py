@@ -2,7 +2,7 @@
 
 Captured graphs have opaque tensor IDs (t0, t1, ...) unlike synthetic test
 graphs that use descriptive names like 'weight_0'.  This file verifies that
-estimate_training() returns meaningful results in both cases.
+estimate_training_from_graphs() returns meaningful results in both cases.
 """
 from __future__ import annotations
 
@@ -118,7 +118,7 @@ def _captured_style_graph(seq_len=2048, hidden=4096, ffn=16384, num_layers=32) -
 # ── Tests ──────────────────────────────────────────────────────────────────────
 
 def test_pipeline_routing_runs_roofline_and_stream_assign():
-    """estimate_training() via build_training_pipeline must run RooflinePass + StreamAssignPass.
+    """estimate_training_from_graphs() via build_default_pipeline must run RooflinePass + StreamAssignPass.
 
     Verifies that nodes carry latency_us (from RooflinePass) and stream_id
     (from StreamAssignPass), proving the full pipeline ran, not just training passes.
@@ -131,8 +131,8 @@ def test_pipeline_routing_runs_roofline_and_stream_assign():
         training=TrainingConfig(micro_batch=1, global_batch=8),
     )
 
-    from python.zrt.transform.pipeline import build_training_pipeline
-    pipe = build_training_pipeline()
+    from python.zrt.transform.pipeline import build_default_pipeline
+    pipe = build_default_pipeline()
     result = pipe.run(g, ctx)
 
     # All compute nodes must have latency_us (from RooflinePass)
@@ -151,14 +151,14 @@ def test_pipeline_routing_runs_roofline_and_stream_assign():
 
 def test_backward_fusion_rules_fire_on_backward_graph():
     """Verify that backward fusion rules from fusion_rules.py:195-311 match
-    on a synthetic backward graph when run through build_training_pipeline().
+    on a synthetic backward graph when run through build_default_pipeline().
 
     Creates a backward OpGraph with ops matching norm_backward and
     gated_mlp_backward sub-patterns, then asserts at least one node gets
     relabeled with a backward fusion label.
     """
     import math
-    from python.zrt.transform.pipeline import build_training_pipeline
+    from python.zrt.transform.pipeline import build_default_pipeline
 
     # Build a synthetic backward graph with backward-style ops in matching scopes
     nodes: dict[str, OpNode] = {}
@@ -259,7 +259,7 @@ def test_backward_fusion_rules_fire_on_backward_graph():
         training=TrainingConfig(micro_batch=1, global_batch=8),
     )
 
-    pipe = build_training_pipeline()
+    pipe = build_default_pipeline()
     result = pipe.run(graph, ctx)
 
     # Collect all op_types (including fused nodes)
@@ -599,7 +599,7 @@ def test_pp_routing_end_to_end():
     6. Cross-graph fwd→bwd edges survive the per-stage subgraph split.
     """
     from zrt.ir.adapter import stitch_fwd_bwd
-    from zrt.transform.pipeline import build_training_pipeline
+    from zrt.transform.pipeline import build_default_pipeline
 
     fwd = _captured_style_graph()
     bwd = _backward_graph_for_fwd(fwd)
@@ -611,7 +611,7 @@ def test_pp_routing_end_to_end():
         parallel=ParallelConfig(tp=1, pp=2, dp=1),
         training=TrainingConfig(micro_batch=1, global_batch=8),
     )
-    pipe = build_training_pipeline()
+    pipe = build_default_pipeline()
     result = pipe.run(stitched, ctx)
 
     # 1) Every node has stage_id ∈ {0, 1}
@@ -703,7 +703,7 @@ def test_pp_heterogeneous_1f1b_formula():
     a different result from `(M+pp-1)*max(t_stage)` in this case.
     """
     from zrt.ir.adapter import stitch_fwd_bwd
-    from zrt.transform.pipeline import build_training_pipeline
+    from zrt.transform.pipeline import build_default_pipeline
 
     fwd = _captured_style_graph()
     bwd = _backward_graph_for_fwd(fwd)
@@ -724,7 +724,7 @@ def test_pp_heterogeneous_1f1b_formula():
         parallel=ParallelConfig(tp=1, pp=2, dp=1),
         training=TrainingConfig(micro_batch=1, global_batch=8),
     )
-    result = build_training_pipeline().run(stitched, ctx)
+    result = build_default_pipeline().run(stitched, ctx)
 
     stage_fwd = result.metadata.get("stage_timelines_fwd", {})
     stage_bwd = result.metadata.get("stage_timelines_bwd", {})
@@ -823,7 +823,7 @@ def test_modeller_uses_pipeline_step_time_for_schedule_adjustments():
 def test_pp_routing_basic():
     """End-to-end: stitch fwd+bwd → pipeline with pp=2 → per-stage timelines + P2P + 1F1B."""
     from zrt.ir.adapter import stitch_fwd_bwd
-    from zrt.transform.pipeline import build_training_pipeline
+    from zrt.transform.pipeline import build_default_pipeline
 
     fwd = _captured_style_graph()
     bwd = _backward_graph_for_fwd(fwd)
@@ -835,7 +835,7 @@ def test_pp_routing_basic():
         parallel=ParallelConfig(tp=1, pp=2, dp=1),
         training=TrainingConfig(micro_batch=1, global_batch=8),
     )
-    pipe = build_training_pipeline()
+    pipe = build_default_pipeline()
     result = pipe.run(stitched, ctx)
 
     # 1) Every node has stage_id in {0, 1}

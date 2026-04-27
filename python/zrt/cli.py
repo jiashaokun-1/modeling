@@ -179,6 +179,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Two independent training estimation paths:
+    # 1. Graph-native (--train --hw): Capture aten ops, apply transforms, schedule
+    # 2. Spec-based (--estimate-config): Reference validation using analytical ModelSpec
+    #    Spec-based is DEPRECATED for production; prefer graph-native path.
     if args.estimate_config:
         _run_estimate(args.estimate_config, args.output)
         return

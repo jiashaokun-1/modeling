@@ -123,7 +123,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
             │                       因此 records 只包含 backward 算子。
             ▼
             _run_training_modelling (cli.py:312)
-            └── estimate_training_from_graphs (transform/analysis/modeller.py:177)
+            └── estimate_training_from_graphs (transform/analysis/modeller.py:112)
                  ├── 注入 metadata（seq_len/num_layers/hidden/...）到两张图
                  ├── stitch_fwd_bwd (ir/adapter.py:613)
                  │     │ 给 fwd 节点 annotation["phase"]="fwd"，bwd 节点 id 加 "bwd_" 前缀且 phase="bwd"
@@ -133,7 +133,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
                  ▼
                  TransformContext(training=TrainingConfig(...), parallel=ParallelConfig(...))
                  ▼
-                 build_training_pipeline = build_pipeline (同一函数，根据 ctx 条件激活)
+                 build_default_pipeline() (transform/pipeline.py:122，统一的 split→fuse→optim→analyze)
                  实际激活的 Pass（is_train=True 时）:
                    split   : DataParallelPass[dp>1] → TensorParallelPass[tp>1] → ExpertParallelPass[ep>1]
                              → ContextParallelPass[cp>1] → CommInserterPass[tp/ep/cp>1] → PipelineParallelPass[pp>1]
@@ -154,7 +154,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
                  │   （MC2 全部隐藏；CoC 隐藏 (k-1)/k；ring_cp 减目标 fa_tile）
                  └── 写入 metadata["pipeline_metrics"]：MFU(去掉 recompute)、HFU、bubble、warmup/cooldown
                  ▼
-                 TrainingReport（modeller.py:34）→ summary() 打印 + JSON 文件
+                 TrainingReport（modeller.py:22）→ summary() 打印 + JSON 文件
 ```
 
 ### 1.4 业务流 C：Spec-based 训练估计（不做图捕获）
@@ -290,7 +290,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 ### 4.1 顶层（`pipeline.py` / `context.py` / `base.py`）
 - `GraphPass` 抽象基类：`name` + `run(graph, ctx) -> graph`。
 - `TransformPipeline` 把 Pass 注册到固定四阶段 `("split","fuse","optim","analyze")`，每个 Pass 可带 `condition(ctx)->bool`。
-- `build_pipeline()`（同时是 `build_default_pipeline` 和 `build_training_pipeline` 的别名）按下表注入条件：
+- `build_pipeline()` 构造统一的流水线（推理和训练共用）；`build_default_pipeline = build_pipeline`。根据 `ctx.is_training` 自动激活训练类 Pass，无需分开两条路：
 
 | 阶段 | Pass | 触发条件 |
 |---|---|---|
@@ -383,9 +383,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 
 ### 4.7 `analysis/modeller.py`
 - `TrainingReport` 数据类（含 step/per_stage/mfu/hfu/flops/memory/pipeline/total_params）。
-- `estimate_training(graph, ctx)`：纯图入口，跑流水线后从 `metadata` 提取指标。
-- `estimate_training_from_graphs(forward_graph, backward_graph, ...)`：CLI `--train --hw` 用的入口（流程见 §1.3）。
-- `model_training(model_id, ...)`：先 `run_trace_phases` 后再调上面那个。
+- `estimate_training_from_graphs(forward_graph, backward_graph, ...)`：**唯一的图原生训练估计入口**，由 CLI `--train --hw` 调用（流程见 §1.3）。接收已捕获的前向和后向 OpGraph，内部调用 `stitch_fwd_bwd`、`build_default_pipeline` 和各类 Pass 完成端到端估计。
 
 ---
 

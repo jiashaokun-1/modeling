@@ -243,7 +243,6 @@ python -m python.zrt hf_models/llama3_8b --train --layers 2
 
 ```bash
 # 基于捕获图的训练建模
-source ~/Ascend/ascend-toolkit/set_env.sh && \
 PYTHONPATH={PATH_TO}/modeling/python
 python -m python.zrt hf_models/deepseek_v3 \
     --layers 4 \

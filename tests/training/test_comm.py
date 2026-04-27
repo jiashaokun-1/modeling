@@ -1,7 +1,7 @@
 """Test communication model — alpha-beta collective costs."""
 
 import pytest
-from zrt.training.ir.graph import Collective
+from zrt.training.ir.training_graph import Collective
 from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
 from zrt.training.spec.system import NetTier, SystemSpec, GPU
 

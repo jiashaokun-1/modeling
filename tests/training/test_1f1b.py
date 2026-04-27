@@ -1,7 +1,7 @@
 """Test 1F1B pipeline schedule — bubble ratio matches Megatron paper."""
 
 import pytest
-from zrt.training.compose.pipeline import OneF1BComposer, pipeline_step_time
+from zrt.training.compose.schedules import OneF1BComposer, pipeline_step_time
 from zrt.training.compose.stage import StageTime
 from zrt.training.ir.builders import build_graph
 from zrt.training.spec.dtype import Dtype

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from zrt.training.ir.graph import Graph, Op, Tensor
+from zrt.training.ir.training_graph import Graph, Op, Tensor
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import Strategy

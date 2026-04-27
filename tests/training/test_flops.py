@@ -2,6 +2,7 @@
 
 import pytest
 from zrt.training.ir.builders import build_graph
+from zrt.training.ir.training_graph import Op
 from zrt.training.models.flops import OpCost, op_cost, total_training_flops, recompute_overhead_flops
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
@@ -10,7 +11,6 @@ from zrt.training.spec.strategy import RecomputePolicy, Strategy
 
 def test_matmul_cost():
     """Matmul: fwd = dx = dw = 2*m*n*k."""
-    from zrt.training.ir.graph import Op
     op = Op(name="test_mm", kind="matmul", meta={"m": 1024, "n": 4096, "k": 4096})
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
@@ -27,7 +27,6 @@ def test_matmul_cost():
 
 def test_attn_core_cost():
     """Attention core: causal fwd = 2*b*s^2*h*d."""
-    from zrt.training.ir.graph import Op
     op = Op(name="test_attn", kind="attn_core", meta={
         "b": 1, "s": 2048, "heads": 32, "head_dim": 128, "causal": True,
     })
@@ -46,7 +45,6 @@ def test_attn_core_cost():
 
 def test_attn_core_cost_uses_model_compression_ratio():
     """Compressed attention scales fwd and backward attention-core FLOPs."""
-    from zrt.training.ir.graph import Op
     op = Op(name="test_attn", kind="attn_core", meta={
         "b": 1, "s": 1024, "heads": 16, "head_dim": 128, "causal": True,
     })
@@ -68,7 +66,6 @@ def test_attn_core_cost_uses_model_compression_ratio():
 
 def test_attn_core_cost_op_ratio_overrides_model_ratio():
     """Per-op metadata can override a model-level compression ratio."""
-    from zrt.training.ir.graph import Op
     op = Op(name="test_attn", kind="attn_core", meta={
         "b": 1, "s": 512, "heads": 8, "head_dim": 128,
         "causal": True, "attn_compression_ratio": 0.5,
@@ -88,7 +85,6 @@ def test_attn_core_cost_op_ratio_overrides_model_ratio():
 
 def test_memory_bound_cost():
     """Memory-bound ops (ln, softmax, etc.) should have byte traffic."""
-    from zrt.training.ir.graph import Op
     op = Op(name="test_ln", kind="ln", meta={"bytes_fwd": 1000})
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
@@ -126,7 +122,6 @@ def test_6p_rule():
 
 def test_unknown_op_zero_cost():
     """Unknown op kinds should return zero cost."""
-    from zrt.training.ir.graph import Op
     op = Op(name="unknown", kind="custom_op", meta={})
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
@@ -138,11 +133,13 @@ def test_unknown_op_zero_cost():
     assert cost.dx_flops == 0.0
 
 
+
+
 def test_moe_effective_params_is_sane():
     """MoE effective params should be less than total params when top_k < num_experts."""
     from zrt.training.spec.system import GPU, NetTier, SystemSpec
     from zrt.training.spec.strategy import Strategy
-    from zrt.training.compose.pipeline import compute_mfu
+    from zrt.training.compose.schedules import compute_mfu
 
     # Minimal MoE model: 2 layers, 4 experts, top_k=1
     model = ModelSpec(

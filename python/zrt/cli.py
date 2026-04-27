@@ -55,9 +55,15 @@ def main() -> None:
              "Example: --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml",
     )
     parser.add_argument(
+        "--search-config",
+        metavar="YAML",
+        help="Grid-search parallel strategies for a training config. "
+             "Example: --search-config python/zrt/training/configs/llama3_70b_3d.yaml",
+    )
+    parser.add_argument(
         "--output",
         metavar="FILE",
-        help="Write estimation result as JSON to FILE (used with --estimate-config).",
+        help="Write estimation/search result as JSON to FILE (used with --estimate-config or --search-config).",
     )
     parser.add_argument(
         "model_id", nargs="?",
@@ -179,12 +185,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Two independent training estimation paths:
+    # Three independent training estimation paths:
     # 1. Graph-native (--train --hw): Capture aten ops, apply transforms, schedule
-    # 2. Spec-based (--estimate-config): Reference validation using analytical ModelSpec
+    # 2. Spec-based (--estimate-config): Single-point estimation using analytical ModelSpec
+    # 3. Grid search (--search-config): Multi-point search over parallel strategies
     #    Spec-based is DEPRECATED for production; prefer graph-native path.
     if args.estimate_config:
         _run_estimate(args.estimate_config, args.output)
+        return
+
+    if args.search_config:
+        _run_search(args.search_config, args.output)
         return
 
     # Resolve model_id
@@ -382,6 +393,40 @@ def _run_estimate(config_path: str, output_path: str | None) -> None:
         print(f"Report written to {output_path}")
     else:
         print(report_summary(report))
+
+
+def _run_search(config_path: str, output_path: str | None) -> None:
+    """Grid-search parallel strategies for a training config."""
+    from python.zrt.training.io.config_loader import load_specs
+    from python.zrt.training.search.estimator import grid_search, pareto_frontier
+    from python.zrt.training.search.space import SearchSpace
+    from python.zrt.training.search.report import report_summary, report_to_dict
+
+    model, system, strategy = load_specs(config_path)
+
+    # Preserve config-level batch settings in search space
+    space = SearchSpace(
+        micro_batch=strategy.micro_batch,
+        global_batch=strategy.global_batch,
+    )
+
+    print(f"Searching {len(space.strategies(system.world_size))} strategies...")
+    reports = grid_search(model, system, space)
+    print(f"Found {len(reports)} valid configurations.\n")
+
+    frontier = pareto_frontier(reports)
+    print(f"Pareto frontier: {len(frontier)} configurations\n")
+
+    for i, r in enumerate(frontier, 1):
+        print(f"--- Frontier config {i} ---")
+        print(report_summary(r))
+        print()
+
+    if output_path and frontier:
+        import json as _json
+        frontier_data = [report_to_dict(r) for r in frontier]
+        Path(output_path).write_text(_json.dumps(frontier_data, indent=2))
+        print(f"Pareto frontier written to {output_path}")
 
 
 if __name__ == "__main__":

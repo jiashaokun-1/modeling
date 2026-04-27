@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from zrt.training.compose.pipeline import StepResult, pipeline_step_time
+from zrt.training.compose.schedules import StepResult, pipeline_step_time
 from zrt.training.ir.builders import build_graph
 from zrt.training.ir.validate import validate as ir_validate
 from zrt.training.models.flops import total_training_flops

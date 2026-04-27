@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from zrt.training.ir.graph import Graph, Op
+from zrt.training.ir.training_graph import Graph, Op
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import Strategy
 

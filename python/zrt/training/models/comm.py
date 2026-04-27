@@ -5,7 +5,7 @@ Per-collective cost using topology-aware latency and bandwidth.
 
 from __future__ import annotations
 
-from zrt.training.ir.graph import Collective, Graph
+from zrt.training.ir.training_graph import Collective, Graph
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import NetTier, SystemSpec

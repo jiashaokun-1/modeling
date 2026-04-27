@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from zrt.training.ir.graph import Collective, Graph, Op
+from zrt.training.ir.training_graph import Collective, Graph, Op
 from zrt.training.io.perf_tables import achieved_bandwidth_efficiency, achieved_flops_efficiency
 from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
 from zrt.training.models.flops import OpCost, op_cost

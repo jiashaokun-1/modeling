@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from zrt.training.ir.graph import Collective, Graph
+from zrt.training.ir.training_graph import Collective, Graph
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import CPKind, Strategy
 

@@ -9,13 +9,24 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from zrt.training.compose.stage import StageTime, stage_time
-from zrt.training.ir.graph import Graph
+from zrt.training.ir.training_graph import Graph
 from zrt.training.models.comm import total_comm_time
 from zrt.training.models.flops import recompute_overhead_flops
 from zrt.training.models.memory import MemBreakdown, memory_breakdown
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import PPSched, Strategy
 from zrt.training.spec.system import SystemSpec
+
+
+PP_SCHED_BY_NAME: dict[str, PPSched] = {
+    "1f1b": PPSched.ONE_F_ONE_B,
+    "interleaved": PPSched.INTERLEAVED,
+    "i1f1b": PPSched.INTERLEAVED,
+    "zb": PPSched.ZERO_BUBBLE,
+    "zero_bubble": PPSched.ZERO_BUBBLE,
+    "dualpipe": PPSched.DUALPIPE,
+    "dualpipev": PPSched.DUALPIPE_V,
+}
 
 
 @dataclass
@@ -31,6 +42,8 @@ class StepResult:
     mfu: float = 0.0
     hfu: float = 0.0
     schedule_name: str = "1f1b"    # Pipeline schedule identifier
+    warmup_steps: int = 0          # Number of warmup microbatches
+    cooldown_steps: int = 0        # Number of cooldown microbatches
 
 
 class PipelineComposer(ABC):
@@ -84,6 +97,8 @@ class OneF1BComposer(PipelineComposer):
                 cooldown=0.0,
                 dp_ar_exposed=dp_exposed,
                 schedule_name="1f1b",
+                warmup_steps=0,
+                cooldown_steps=0,
             )
 
         # With pipeline parallelism
@@ -114,6 +129,8 @@ class OneF1BComposer(PipelineComposer):
             cooldown=cooldown,
             dp_ar_exposed=dp_exposed,
             schedule_name="1f1b",
+            warmup_steps=pp - 1,
+            cooldown_steps=pp - 1,
         )
 
 
@@ -166,6 +183,8 @@ class Interleaved1F1BComposer(PipelineComposer):
             cooldown=cooldown,
             dp_ar_exposed=dp_exposed,
             schedule_name="i1f1b",
+            warmup_steps=max(1, -(-(pp - 1) // V)),  # ceil((pp-1)/V)
+            cooldown_steps=max(1, -(-(pp - 1) // V)),
         )
 
 
@@ -213,6 +232,8 @@ class DualPipeComposer(PipelineComposer):
             cooldown=cooldown,
             dp_ar_exposed=dp_exposed,
             schedule_name="dualpipe",
+            warmup_steps=max(1, -(-(pp - 1) // 2)),  # ceil((pp-1)/2)
+            cooldown_steps=max(1, -(-(pp - 1) // 2)),
         )
 
 
@@ -259,6 +280,8 @@ class DualPipeVComposer(PipelineComposer):
             cooldown=cooldown,
             dp_ar_exposed=dp_exposed,
             schedule_name="dualpipev",
+            warmup_steps=max(1, -(-(pp - 1) // (2 * V))),  # ceil((pp-1)/(2*V))
+            cooldown_steps=max(1, -(-(pp - 1) // (2 * V))),
         )
 
 
@@ -308,15 +331,17 @@ class ZeroBubbleComposer(PipelineComposer):
             cooldown=cooldown,
             dp_ar_exposed=dp_exposed,
             schedule_name="zb",
+            warmup_steps=pp - 1,
+            cooldown_steps=pp - 1,
         )
 
 
-_COMPOSERS: dict[PPSched, PipelineComposer] = {
-    PPSched.ONE_F_ONE_B: OneF1BComposer(),
-    PPSched.INTERLEAVED: Interleaved1F1BComposer(),
-    PPSched.ZERO_BUBBLE: ZeroBubbleComposer(),
-    PPSched.DUALPIPE: DualPipeComposer(),
-    PPSched.DUALPIPE_V: DualPipeVComposer(),
+COMPOSER_BY_SCHED: dict[PPSched, type[PipelineComposer]] = {
+    PPSched.ONE_F_ONE_B: OneF1BComposer,
+    PPSched.INTERLEAVED: Interleaved1F1BComposer,
+    PPSched.ZERO_BUBBLE: ZeroBubbleComposer,
+    PPSched.DUALPIPE: DualPipeComposer,
+    PPSched.DUALPIPE_V: DualPipeVComposer,
 }
 
 
@@ -328,21 +353,17 @@ def pipeline_step_time(
 ) -> StepResult:
     """Compute full training step time from IR + strategy.
 
-    TODO Phase 3: Integrate with graph-native per-stage timelines from executor/.
+    Graph-native counterpart: TrainingPipelinePass in transform/analysis/training.py
+    — uses per-stage timelines from DAGScheduler instead of formula-based stage_time().
 
-    Graph-native path (phase 3):
-      1. Run DAGScheduler per PP stage on stitched fwd+bwd OpGraph
-      2. Extract (t_fwd[s], t_bwd[s]) from timeline.phase_latency("fwd")/("bwd")
-      3. Pass per-stage timelines to VPP/DualPipe/DualPipeV composers
-      4. Compute DP-in-bubble from actual overlap windows
-      5. Replace formula-based stage_time() with timeline-derived values
-
-    Current path (reference implementation):
+    Current path (IR-based reference implementation):
       - Use IR-level stage_time() from graph.ops_for_stage()
       - Apply 1F1B/VPP/DualPipe formulas on aggregated times
       - DP overlap uses simple bubble-window heuristic
 
-    Both paths should converge to the same StepResult interface for compatibility.
+    Both paths use the same PipelineComposer classes (OneF1BComposer, Interleaved1F1BComposer,
+    ZeroBubbleComposer, DualPipeComposer, DualPipeVComposer) and converge to the same
+    StepResult interface for compatibility.
     """
     pp = strategy.pp
     M = strategy.num_microbatches()
@@ -369,7 +390,8 @@ def pipeline_step_time(
     dp_ar_time = comm_times.get("dp_grad_reduce", 0.0)
 
     # Compose according to schedule
-    composer = _COMPOSERS.get(strategy.pp_schedule, OneF1BComposer())
+    composer_cls = COMPOSER_BY_SCHED.get(strategy.pp_schedule, OneF1BComposer)
+    composer = composer_cls()
     step = composer.compose(stage_times, M, pp, dp_ar_time, strategy)
 
     step.per_stage = stage_times
@@ -412,6 +434,22 @@ def _assign_stages(model: ModelSpec, strategy: Strategy) -> list[list[int]]:
     return stages
 
 
+def util_from_flops(flops: float, peak_flops_total: float, step_time_s: float) -> float:
+    """Compute utilization ratio from FLOPs.
+
+    Args:
+        flops: Total FLOPs executed (e.g., model FLOPs or model+recompute FLOPs)
+        peak_flops_total: Peak FLOP/s of entire system (world_size * per_gpu_peak)
+        step_time_s: Step time in seconds
+
+    Returns:
+        Utilization ratio capped at 1.0, or 0.0 if inputs are invalid.
+    """
+    if step_time_s <= 0 or peak_flops_total <= 0:
+        return 0.0
+    return min(flops / (peak_flops_total * step_time_s), 1.0)
+
+
 def compute_mfu(
     model: ModelSpec, strategy: Strategy,
     system: SystemSpec, step_time: float,
@@ -423,9 +461,6 @@ def compute_mfu(
     For MoE models, uses effective_params_for_flops() which accounts for top_k
     expert sparsity instead of counting all expert parameters.
     """
-    if step_time <= 0:
-        return 0.0
-
     # Model FLOPs per token for forward pass: ~6 * P (P = effective params)
     # Full training step (fwd+bwd): ~6P per token
     # For MoE: effective_params_for_flops() only counts active expert params (top_k/num_experts)
@@ -436,8 +471,7 @@ def compute_mfu(
     # Peak FLOP/s of entire cluster
     peak = system.gpu.flops_bf16 * 1e12 * system.world_size  # TFLOP/s -> FLOP/s, times world
 
-    mfu = model_flops / (peak * step_time)
-    return min(mfu, 1.0)  # cap at 100%
+    return util_from_flops(model_flops, peak, step_time)
 
 
 def compute_hfu(
@@ -449,14 +483,10 @@ def compute_hfu(
 
     HFU = (model_flops + recompute_overhead) / (peak * step_time)
     """
-    if step_time <= 0:
-        return 0.0
-
     P = model.effective_params_for_flops()
     tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
     model_flops = 6.0 * P * tokens
     rc_overhead = recompute_overhead_flops(graph, model, strategy)
     peak = system.gpu.flops_bf16 * 1e12 * system.world_size
 
-    hfu = (model_flops + rc_overhead) / (peak * step_time)
-    return min(hfu, 1.0)
+    return util_from_flops(model_flops + rc_overhead, peak, step_time)

@@ -422,32 +422,12 @@ class TrainingPipelinePass(GraphPass):
 
         # ── Delegate to PipelineComposer ──────────────────────────────────
         from python.zrt.training.compose.stage import StageTime as _StageTime
-        from python.zrt.training.compose.pipeline import (
-            OneF1BComposer, Interleaved1F1BComposer, ZeroBubbleComposer,
-            DualPipeComposer, DualPipeVComposer,
+        from python.zrt.training.compose.schedules import (
+            PP_SCHED_BY_NAME, COMPOSER_BY_SCHED,
         )
         from python.zrt.training.spec.strategy import (
-            Strategy as _Strategy, PPSched, OptKind,
+            Strategy as _Strategy, OptKind,
         )
-
-        _PP_SCHED_MAP = {
-            "1f1b": PPSched.ONE_F_ONE_B,
-            "interleaved": PPSched.INTERLEAVED,
-            "i1f1b": PPSched.INTERLEAVED,
-            "zb": PPSched.ZERO_BUBBLE,
-            "zero_bubble": PPSched.ZERO_BUBBLE,
-            "dualpipe": PPSched.DUALPIPE,
-            "dualpipev": PPSched.DUALPIPE_V,
-        }
-        _COMPOSER_MAP = {
-            "1f1b": OneF1BComposer,
-            "interleaved": Interleaved1F1BComposer,
-            "i1f1b": Interleaved1F1BComposer,
-            "zb": ZeroBubbleComposer,
-            "zero_bubble": ZeroBubbleComposer,
-            "dualpipe": DualPipeComposer,
-            "dualpipev": DualPipeVComposer,
-        }
         _OPT_MAP = {"adam": OptKind.ADAM, "adamw": OptKind.ADAM, "muon": OptKind.MUON}
 
         pp_schedule = ctx.training.pp_schedule if ctx.training else "1f1b"
@@ -472,14 +452,16 @@ class TrainingPipelinePass(GraphPass):
             cp=getattr(ctx.parallel, "cp", 1) if ctx.parallel else 1,
             micro_batch=ctx.training.micro_batch if ctx.training else 1,
             global_batch=ctx.training.global_batch if ctx.training else 32,
-            pp_schedule=_PP_SCHED_MAP.get(pp_schedule, PPSched.ONE_F_ONE_B),
+            pp_schedule=PP_SCHED_BY_NAME.get(pp_schedule, PP_SCHED_BY_NAME["1f1b"]),
             vpp_chunks=max(1, ctx.training.vpp_chunks if ctx.training else 1),
             zero_stage=ctx.training.zero_stage if ctx.training else 0,
             optimizer=_OPT_MAP.get(opt_str, OptKind.ADAM),
             dp_overlap_in_bubble=ctx.training.dp_overlap_in_bubble if ctx.training else True,
         )
 
-        composer_cls = _COMPOSER_MAP.get(pp_schedule, OneF1BComposer)
+        composer_cls = COMPOSER_BY_SCHED.get(strategy_proxy.pp_schedule)
+        if composer_cls is None:
+            composer_cls = COMPOSER_BY_SCHED[PP_SCHED_BY_NAME["1f1b"]]
         step_result = composer_cls().compose(
             stage_times_list, num_microbatches, pp, dp_ar_time_s, strategy_proxy
         )
@@ -535,18 +517,8 @@ class TrainingPipelinePass(GraphPass):
             step_time_us -= hidden_us
             step_time_ms = step_time_us / 1000.0
 
-        # Derive warmup/cooldown step counts from schedule semantics
-        _V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
-        if pp_schedule in {"dualpipe", "dualpipev"}:
-            _half = max(1, -(-max(pp - 1, 0) // 2))  # ceil((pp-1)/2)
-            warmup_steps = _half
-            cooldown_steps = _half
-        elif pp_schedule in {"interleaved", "i1f1b"} and _V > 1:
-            warmup_steps = max(1, -(-max(pp - 1, 0) // _V))
-            cooldown_steps = warmup_steps
-        else:
-            warmup_steps = max(0, pp - 1)
-            cooldown_steps = max(0, pp - 1)
+        warmup_steps = step_result.warmup_steps
+        cooldown_steps = step_result.cooldown_steps
         steady_steps = num_microbatches
         training_flops = g.metadata.get("training_flops", 0.0)
         world_size = ctx.parallel.total_devices if ctx.parallel else 1
@@ -558,12 +530,13 @@ class TrainingPipelinePass(GraphPass):
         peak_flops_total = world_size * peak_flops_per_gpu
 
         # MFU: model FLOPs only (excludes recompute overhead)
+        from python.zrt.training.compose.schedules import util_from_flops
         recompute_flops = float(g.metadata.get("recompute_flops", 0))
         model_flops = training_flops - recompute_flops
-        mfu = (model_flops / step_time_sec / peak_flops_total) if (step_time_sec > 0 and peak_flops_total > 0) else 0.0
+        mfu = util_from_flops(model_flops, peak_flops_total, step_time_sec)
 
         # HFU: all executed FLOPs including recompute
-        hfu = (training_flops / step_time_sec / peak_flops_total) if (step_time_sec > 0 and peak_flops_total > 0) else 0.0
+        hfu = util_from_flops(training_flops, peak_flops_total, step_time_sec)
 
         metrics = PipelineStepMetrics(
             step_time_ms=step_time_ms,

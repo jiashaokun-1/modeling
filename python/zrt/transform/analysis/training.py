@@ -421,20 +421,20 @@ class TrainingPipelinePass(GraphPass):
                 stage_bwd_dw[s] = 0.0
 
         # ── Delegate to PipelineComposer ──────────────────────────────────
-        from python.zrt.training.compose.stage import StageTime as _StageTime
+        from python.zrt.training.compose.stage import StageTime
         from python.zrt.training.compose.schedules import (
             PP_SCHED_BY_NAME, COMPOSER_BY_SCHED,
         )
         from python.zrt.training.spec.strategy import (
-            Strategy as _Strategy, OptKind,
+            Strategy, OptKind,
         )
-        _OPT_MAP = {"adam": OptKind.ADAM, "adamw": OptKind.ADAM, "muon": OptKind.MUON}
+        OPT_MAP = {"adam": OptKind.ADAM, "adamw": OptKind.ADAM, "muon": OptKind.MUON}
 
         pp_schedule = ctx.training.pp_schedule if ctx.training else "1f1b"
         opt_str = ctx.training.optimizer if ctx.training else "adam"
 
         stage_times_list = [
-            _StageTime(
+            StageTime(
                 fwd=stage_fwd.get(s, 0.0) / 1e6,
                 bwd=stage_bwd.get(s, 0.0) / 1e6,
                 bwd_dw=stage_bwd_dw.get(s, 0.0) / 1e6,
@@ -444,7 +444,7 @@ class TrainingPipelinePass(GraphPass):
 
         dp_ar_time_s = self._compute_dp_ar_time(g, hw, ctx) / 1e6
 
-        strategy_proxy = _Strategy(
+        strategy_proxy = Strategy(
             tp=ctx.parallel.tp if ctx.parallel else 1,
             pp=pp,
             ep=ctx.parallel.ep if ctx.parallel else 1,
@@ -455,7 +455,7 @@ class TrainingPipelinePass(GraphPass):
             pp_schedule=PP_SCHED_BY_NAME.get(pp_schedule, PP_SCHED_BY_NAME["1f1b"]),
             vpp_chunks=max(1, ctx.training.vpp_chunks if ctx.training else 1),
             zero_stage=ctx.training.zero_stage if ctx.training else 0,
-            optimizer=_OPT_MAP.get(opt_str, OptKind.ADAM),
+            optimizer=OPT_MAP.get(opt_str, OptKind.ADAM),
             dp_overlap_in_bubble=ctx.training.dp_overlap_in_bubble if ctx.training else True,
         )
 

@@ -1,6 +1,6 @@
 """Single-point estimator — the main entry point.
 
-Flow: validate → build_graph → op_cost → stage_time → pipeline_step_time → Report
+Flow: validate → build_graph → op_cost → stage_time → pipeline_step_time → TrainingReport
 """
 
 from __future__ import annotations
@@ -13,30 +13,21 @@ from zrt.training.ir.validate import validate as ir_validate
 from zrt.training.models.flops import total_training_flops
 from zrt.training.models.memory import MemBreakdown
 from zrt.training.spec.model import ModelSpec
+from zrt.training.spec.report import TrainingReport
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import SystemSpec
 
 
-@dataclass
-class Report:
-    step_time_ms: float = 0.0
-    mfu: float = 0.0
-    hfu: float = 0.0
-    memory: MemBreakdown | None = None
-    per_stage: list = field(default_factory=list)
-    total_flops: float = 0.0
-    warnings: list[str] = field(default_factory=list)
-    config_summary: dict = field(default_factory=dict)
-    bubble_fraction: float = 0.0
-    schedule_name: str = "1f1b"
+# Legacy alias for backward compatibility
+Report = TrainingReport
 
 
 def estimate(
     model: ModelSpec, system: SystemSpec, strategy: Strategy,
-) -> Report:
+) -> TrainingReport:
     """Single-point evaluation of a training config.
 
-    Returns a Report with step time, MFU, memory, and per-stage breakdown.
+    Returns a TrainingReport with step time, MFU, memory, and per-stage breakdown.
     """
     # Validate
     strategy.validate(model, system)
@@ -63,7 +54,7 @@ def estimate(
         "zero_stage": strategy.zero_stage,
     }
 
-    return Report(
+    return TrainingReport(
         step_time_ms=step_result.step_time * 1000,  # convert to ms
         mfu=step_result.mfu,
         hfu=step_result.hfu,
@@ -79,10 +70,10 @@ def estimate(
 
 def grid_search(
     model: ModelSpec, system: SystemSpec, space: "SearchSpace",
-) -> list[Report]:
+) -> list[TrainingReport]:
     """Grid search over all valid parallel configurations.
 
-    Returns list of Reports sorted by step_time_ms (ascending).
+    Returns list of TrainingReports sorted by step_time_ms (ascending).
     Invalid configurations (validation errors) are skipped.
     """
     from zrt.training.search.space import SearchSpace
@@ -110,7 +101,7 @@ def grid_search(
     return reports
 
 
-def pareto_frontier(reports: list[Report]) -> list[Report]:
+def pareto_frontier(reports: list[TrainingReport]) -> list[TrainingReport]:
     """Extract Pareto frontier (step_time_ms, peak_hbm) with deterministic ordering.
 
     A config is on the Pareto frontier if no other config has both:

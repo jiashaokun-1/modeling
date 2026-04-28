@@ -162,12 +162,27 @@ def _numel(shape: tuple[int, ...]) -> int:
 
 
 def _primary_dtype(node: "OpNode") -> DType:
-    """Return the dominant dtype for compute-throughput lookup."""
-    if node.outputs:
-        return node.outputs[0].dtype
-    if node.inputs:
-        return node.inputs[0].dtype
-    return DType.BF16
+    """Return the dominant dtype for compute-throughput lookup.
+
+    For compute nodes, activation dtype (inputs[0]) drives tensor-core selection.
+    Falls back to output dtype for non-compute or no-input nodes.
+    Also respects quant_act annotation for hypothetical-quant analysis.
+    """
+    if node.category != "compute" or not node.inputs:
+        if node.outputs:
+            return node.outputs[0].dtype
+        return DType.BF16
+    # Annotation path: QuantizationPass wrote quant_act on this node
+    quant_act = node.annotations.get("quant_act")
+    if quant_act and quant_act not in ("bf16", "fp16", "fp32"):
+        # Normalize fp8 alias to fp8_e4m3 (default FP8 format for training)
+        normalized = "fp8_e4m3" if quant_act == "fp8" else quant_act
+        try:
+            return DType(normalized)
+        except ValueError:
+            pass
+    # Captured dtype path: use activation tensor (inputs[0]) dtype
+    return node.inputs[0].dtype
 
 
 def _itemsize(node: "OpNode") -> float:

@@ -40,6 +40,7 @@ def estimate_training_from_graphs(
     global_batch: int = 32,
     pp_schedule: str = "1f1b",
     vpp_chunks: int = 1,
+    quant: str | None = None,
 ) -> TrainingReport:
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -47,7 +48,7 @@ def estimate_training_from_graphs(
     runs the training analysis pipeline. Use this when the graphs have
     already been captured by ``run_trace_phases``.
     """
-    from python.zrt.transform.context import ParallelConfig, TrainingConfig, TransformContext
+    from python.zrt.transform.context import ParallelConfig, QuantConfig, TrainingConfig, TransformContext
     from python.zrt.transform.pipeline import build_default_pipeline
 
     metadata: dict = {
@@ -68,6 +69,7 @@ def estimate_training_from_graphs(
             if key not in backward_graph.metadata:
                 backward_graph.metadata[key] = val
 
+    quant_cfg = QuantConfig(weight=quant, activation=quant) if quant else None
     ctx = TransformContext(
         hw_spec=hw_spec,
         parallel=ParallelConfig(tp=tp, pp=pp, ep=ep, dp=dp, cp=cp),
@@ -79,6 +81,7 @@ def estimate_training_from_graphs(
             pp_schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
         ),
+        quant=quant_cfg,
     )
 
     pipe = build_default_pipeline()

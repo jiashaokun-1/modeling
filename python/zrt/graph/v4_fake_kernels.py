@@ -96,11 +96,23 @@ def fp4_act_quant(
 
 def _quantised_gemm(x: torch.Tensor, sx: torch.Tensor, w: torch.Tensor,
                     sw: torch.Tensor, scale_dtype) -> torch.Tensor:
-    """Common path for fp8/fp4 gemm: dequant + matmul + cast."""
+    """Common path for fp8/fp4 gemm: dequant + matmul + cast.
+
+    For fp4 weights, ``w`` is stored as ``float4_e2m1fn_x2`` with logical in-dim
+    = ``w.shape[-1] * 2`` (2 fp4 values packed per byte). The activation ``x``
+    has the full logical in-dim, so we synthesise a bf16 weight of shape
+    ``(out, in_logical)`` to match before the matmul.  The resulting trace
+    captures the correct (out, in) matmul shape downstream of fp4 quantisation.
+    """
+    in_logical = x.shape[-1]
     out_shape = (*x.shape[:-1], w.shape[0])
     x_bf = x.float().to(torch.bfloat16)
-    w_bf = w.float().to(torch.bfloat16)
-    x_2d = x_bf.reshape(-1, x.shape[-1])
+    if w.dtype == torch.float4_e2m1fn_x2:
+        # packed fp4: in_dim is halved → expand to logical in_dim for the matmul.
+        w_bf = x_bf.new_empty(w.shape[0], in_logical)
+    else:
+        w_bf = w.float().to(torch.bfloat16)
+    x_2d = x_bf.reshape(-1, in_logical)
     out_2d = x_2d @ w_bf.t()
     return out_2d.reshape(out_shape)
 

@@ -1,0 +1,42 @@
+# DeepSeek-V4 model specification
+# Reference: hf_models/deepseek_v4/config.json
+# Notable departures from V3:
+#   - all 61 transformer layers are MoE (first 3 use hash routing internally)
+#   - top_k = 6 (V3: 8); n_routed_experts = 384 (V3: 256); moe_ffn = 3072 (V3: 2048)
+#   - Hyper-Connections: hc_mult = 4, hc_sinkhorn_iters = 20
+#   - FP4 expert weights (placeholder dtype below until fp4 simulator lands)
+#   - sparse attention via Indexer (compress_ratios alternate 128/4 per layer)
+
+name: deepseek-v4
+hidden: 7168
+ffn: 18432              # placeholder; V4 has no real dense layers
+num_heads: 128
+num_kv_heads: 128       # MLA: configured K/V projected to heads = num_heads in our model
+head_dim: 128           # main attn head_dim used for FLOPs accounting
+vocab: 129280
+seq_len: 4096
+layers: "[moe]*61+[mtp]*1"
+num_experts: 384
+moe_ffn: 3072
+top_k: 6
+n_group: 8              # group-limited gating (kept aligned with V3)
+top_k_group: 4
+n_shared_experts: 1
+capacity_factor: 1.0
+expert_imbalance: 0.10
+mtp_depth: 1
+
+# Hyper-Connections
+hc_mult: 4
+hc_sinkhorn_iters: 20
+
+# Sparse attention compression ratio (avg over per-layer compress_ratios in
+# config.json: alternating 128/4). Refine once V4 anchor MFU is calibrated.
+attn_compression_ratio: 0.5
+
+# dtypes — expert weights are fp4 in V4 but we keep bf16 here until the fp4
+# memory/FLOPs path is wired up end-to-end (housekeeping task).
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16

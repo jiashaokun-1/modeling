@@ -1,0 +1,19 @@
+name: deepseek_v4
+description: "DeepSeek-V4 placeholder anchor, H100 SXM, TP8 PP1 DP8 (8 nodes). MFU target is a placeholder copied from V3 — recalibrate once real V4 step time lands. EP=1 until Phase-3 EP rank-product policy is resolved."
+model: deepseek_v4
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 512
+config:
+  tp: 8
+  pp: 1
+  ep: 1
+  dp: 8
+  zero_stage: 1
+  micro_batch: 1
+  global_batch: 1024
+targets:
+  mfu: 0.45
+  tolerance: 0.20  # wider than V3 (0.15) until placeholder MFU is calibrated

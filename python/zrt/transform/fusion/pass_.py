@@ -86,9 +86,18 @@ def _external_io(
 # ── Pass 1 ────────────────────────────────────────────────────────────────────
 
 def _pass1_leaf(topo: list[OpNode]) -> list[list[OpNode]]:
-    """Group consecutive compute+memory nodes with identical scope+layer."""
+    """Group consecutive compute+memory nodes with identical scope+layer+phase.
+
+    Phase (fwd/bwd in stitched train graphs) is part of the group key so that
+    fusion never spans the forward/backward boundary — those nodes share scope
+    but represent distinct stages and must remain separate for FLOPs / phase
+    accounting downstream.
+    """
     groups: list[list[OpNode]] = []
     current: list[OpNode] = []
+
+    def _phase(node: OpNode) -> str:
+        return node.annotations.get("phase", "")
 
     for node in topo:
         # comm nodes and scopeless nodes are always standalone group-breakers
@@ -101,7 +110,11 @@ def _pass1_leaf(topo: list[OpNode]) -> list[list[OpNode]]:
 
         if current:
             first = current[0]
-            if node.scope == first.scope and node.layer == first.layer:
+            if (
+                node.scope == first.scope
+                and node.layer == first.layer
+                and _phase(node) == _phase(first)
+            ):
                 current.append(node)
                 continue
             groups.append(current)
@@ -150,6 +163,9 @@ def _pass2_parent(
             return False
         return True
 
+    def _phase(g: list[OpNode]) -> str:
+        return g[0].annotations.get("phase", "") if g else ""
+
     result: list[list[OpNode]] = []
     i = 0
     while i < len(leaf_groups):
@@ -157,6 +173,7 @@ def _pass2_parent(
         scope = g[0].scope if g else ""
         p     = _parent(scope) if scope else ""
         layer = g[0].layer if g else ""
+        phase = _phase(g)
 
         # Comm/scopeless groups are never merged upward
         if not scope or g[0].category == "communication":
@@ -171,7 +188,11 @@ def _pass2_parent(
                 ng     = leaf_groups[j]
                 nscope = ng[0].scope if ng else ""
                 np_    = _parent(nscope) if nscope else ""
-                if (np_ == p or nscope == p) and ng[0].layer == layer:
+                if (
+                    (np_ == p or nscope == p)
+                    and ng[0].layer == layer
+                    and _phase(ng) == phase
+                ):
                     total_ops += len(ng)
                     if total_ops > max_parent_ops:
                         break

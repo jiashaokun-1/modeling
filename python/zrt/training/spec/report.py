@@ -155,6 +155,15 @@ class TrainingReport:
         if isinstance(self.config_summary, dict):
             config_str = ", ".join(f"{k}={v}" for k, v in self.config_summary.items())
 
+        def _fmt_util(x: float) -> str:
+            # Avoid round-down-to-zero on uncalibrated / very-low utilisation:
+            # show full precision below 0.1%, percentage otherwise.
+            if x >= 1e-3:
+                return f"{x:.2%}"
+            if x > 0:
+                return f"{x:.4%}  ({x*1e6:.1f} ppm)"
+            return "0.00%"
+
         lines = [
             "Training Estimation Report",
             "=" * 40,
@@ -165,8 +174,8 @@ class TrainingReport:
             f"  Per-stage: {self.per_stage_ms:.2f} ms" if self.per_stage_ms > 0 else "",
             "",
             "Efficiency:",
-            f"  MFU: {self.mfu:.1%}",
-            f"  HFU: {self.hfu:.1%}",
+            f"  MFU: {_fmt_util(self.mfu)}",
+            f"  HFU: {_fmt_util(self.hfu)}",
             "",
             "FLOPs:",
         ]

@@ -63,7 +63,7 @@
   "attention_bias": false,
   "attention_dropout": 0.0,
   "use_cache": true,
-  "torch_dtype": "bfloat16",
+  "dtype": "bfloat16",
 
   "bos_token_id": 0,
   "eos_token_id": 1,

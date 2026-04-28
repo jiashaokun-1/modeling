@@ -107,6 +107,8 @@ def _parse_model(d: dict) -> ModelSpec:
         n_group=d.get("n_group", 0),
         n_shared_experts=d.get("n_shared_experts", 1),
         mtp_depth=d.get("mtp_depth", 0),
+        hc_mult=d.get("hc_mult", 1),
+        hc_sinkhorn_iters=d.get("hc_sinkhorn_iters", 20),
         param_dtype=_parse_dtype(d.get("param_dtype", "bf16")),
         grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),
         master_dtype=_parse_dtype(d.get("master_dtype", "fp32")),

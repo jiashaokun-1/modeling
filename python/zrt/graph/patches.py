@@ -668,17 +668,35 @@ def _upgrade_kernel_stubs_for_backward() -> None:
     # 2. Patch the inference module's own global namespace.
     #    The module name is set by modeling_deepseek._INFERENCE_MODULE_NAME.
     #    We also scan for any module that owns these names to be resilient to
-    #    rename.
+    #    rename, but skip third-party packages whose lazy __getattr__ would
+    #    import optional deps (e.g. transformers.models.aria.image_processing_aria
+    #    pulls torchvision when probed via hasattr).
     _INF_MOD_NAME = "_v4_inference_model"
+    _SKIP_PREFIXES = (
+        "transformers", "torch", "torchvision", "numpy", "scipy",
+        "pandas", "matplotlib", "sklearn", "PIL",
+    )
     for mod_name, mod in list(sys.modules.items()):
         if mod is None or mod is kernel:
             continue
-        if mod_name == _INF_MOD_NAME or (
-            hasattr(mod, "fp4_gemm") and hasattr(mod, "sparse_attn")
-            and hasattr(mod, "hc_split_sinkhorn")
-        ):
+        # Fast path: explicit V4 inference module name match.
+        if mod_name == _INF_MOD_NAME:
             for name, fn in new_fns.items():
-                if hasattr(mod, name):
+                if name in vars(mod):
+                    setattr(mod, name, fn)
+            patched_mods.append(mod_name)
+            continue
+        # Fallback scan: skip third-party packages whose lazy attribute access
+        # may trigger optional-dep imports, and use vars(mod) to avoid hasattr.
+        if any(mod_name == p or mod_name.startswith(p + ".") for p in _SKIP_PREFIXES):
+            continue
+        try:
+            mod_vars = vars(mod)
+        except TypeError:
+            continue
+        if "fp4_gemm" in mod_vars and "sparse_attn" in mod_vars and "hc_split_sinkhorn" in mod_vars:
+            for name, fn in new_fns.items():
+                if name in mod_vars:
                     setattr(mod, name, fn)
             patched_mods.append(mod_name)
 

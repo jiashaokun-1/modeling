@@ -163,6 +163,11 @@ def main() -> None:
         help="Full model param count, e.g. 671e9 (for scaling traced layers).",
     )
     parser.add_argument(
+        "--quant", default=None,
+        metavar="DTYPE",
+        help="Weight quantization dtype for analysis: int4, int8, fp8 (default: no quantization)",
+    )
+    parser.add_argument(
         "--hidden", type=int, default=7168,
         help="Hidden dimension for memory estimation (default: 7168).",
     )
@@ -260,15 +265,18 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         build_default_pipeline, TransformContext,
         ParallelConfig, StreamConfig,
     )
+    from python.zrt.transform.context import QuantConfig
     from python.zrt.executor import DAGScheduler
     from python.zrt.simulator import SimulatorHub
     from python.zrt.report import build_summary, export_html_report, export_chrome_trace
     from python.zrt.report.excel_writer import append_perf_summary
 
+    quant = QuantConfig(weight=args.quant, activation=args.quant) if args.quant else None
     ctx = TransformContext(
         hw_spec=hw,
         parallel=ParallelConfig(tp=args.tp),
         stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+        quant=quant,
     )
     pipe = build_default_pipeline()
     hub = SimulatorHub.default()
@@ -359,6 +367,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         optimizer=args.optimizer,
         micro_batch=args.micro_batch,
         global_batch=args.global_batch,
+        quant=args.quant,
     )
 
     try:

@@ -228,6 +228,153 @@ def patch_indexer_for_fake(model: nn.Module) -> None:
                     ", ".join(c.__name__ for c in patched_classes))
 
 
+# ── DeepSeek-V4 Hyper-Connections capture patch ──────────────────────────────
+# Block.hc_pre / Block.hc_post are *methods* on the inference Block class.  The
+# graph-capture pipeline relies on ``ModuleTracker`` to delimit semantic units
+# by ``nn.Module`` boundaries, so methods are invisible to it.  We do not edit
+# the upstream inference/model.py; instead, at load time we attach 4 wrapper
+# nn.Modules to each Block (and 1 to ParallelHead for the MTP head path) and
+# rebind .forward on the *class* to dispatch through them.  After this patch,
+# ModuleTracker reports paths like ``transformer.layers.0.hc_pre_attn``.
+
+
+class _HCBoundMethodModule(nn.Module):
+    """Base wrapper whose forward delegates to a method bound on a parent module.
+
+    Subclasses (HCPreAttn / HCPostAttn / HCPreFfn / HCPostFfn / HCHead) carry
+    distinct class names so ``fusion_rules.SEMANTIC_LABELS`` can match them
+    individually.  The parent is held by ``weakref`` so this child does not
+    double-register the parent's params in ``state_dict()``.
+    """
+
+    def __init__(self, parent: nn.Module, method_name: str, *param_names: str):
+        super().__init__()
+        import weakref
+        self._parent_ref = weakref.ref(parent)
+        self._method_name = method_name
+        self._param_names = param_names
+
+    def forward(self, *runtime_args):
+        parent = self._parent_ref()
+        if parent is None:
+            raise RuntimeError(f"HC wrapper lost reference to parent before {self._method_name}")
+        method = getattr(type(parent), self._method_name)
+        bound_params = tuple(getattr(parent, n) for n in self._param_names)
+        return method(parent, *runtime_args, *bound_params)
+
+
+class HCPreAttn(_HCBoundMethodModule): pass
+class HCPostAttn(_HCBoundMethodModule): pass
+class HCPreFfn(_HCBoundMethodModule): pass
+class HCPostFfn(_HCBoundMethodModule): pass
+class HCHead(_HCBoundMethodModule): pass
+
+
+def _block_forward_with_hc_modules(self, x, start_pos, input_ids):
+    """Replacement Block.forward routing HC through child nn.Modules."""
+    residual = x
+    x, post, comb = self.hc_pre_attn(x)
+    x = self.attn_norm(x)
+    x = self.attn(x, start_pos)
+    x = self.hc_post_attn(x, residual, post, comb)
+
+    residual = x
+    x, post, comb = self.hc_pre_ffn(x)
+    x = self.ffn_norm(x)
+    x = self.ffn(x, input_ids)
+    x = self.hc_post_ffn(x, residual, post, comb)
+    return x
+
+
+def _head_forward_with_hc_module(self, x, hc_fn, hc_scale, hc_base, norm):
+    """Replacement ParallelHead.forward routing hc_head through a child Module.
+
+    Cannot bind hc_fn / hc_scale / hc_base on the head itself: a single
+    ParallelHead is shared between the main Transformer (uses
+    ``transformer.hc_head_*``) and each MTPBlock (uses ``mtp[i].hc_head_*``).
+    The wrapper module therefore takes them as runtime args.
+    """
+    import torch.distributed as dist
+    x = self.hc_head_module(x, hc_fn, hc_scale, hc_base)
+    logits = self.get_logits(norm(x))
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        all_logits = [torch.empty_like(logits) for _ in range(dist.get_world_size())]
+        dist.all_gather(all_logits, logits)
+        logits = torch.cat(all_logits, dim=-1)
+    return logits
+
+
+def _attach_hc_modules_to_block(block: nn.Module) -> None:
+    """Attach 4 HC wrapper modules to a Block (covers MTPBlock via inheritance)."""
+    if getattr(block, "_hc_patched", False):
+        return
+    # hc_pre takes only x at runtime; hc_*_fn / hc_*_scale / hc_*_base are bound
+    # to the parent block.
+    block.hc_pre_attn = HCPreAttn(
+        block, "hc_pre", "hc_attn_fn", "hc_attn_scale", "hc_attn_base"
+    )
+    block.hc_pre_ffn = HCPreFfn(
+        block, "hc_pre", "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base"
+    )
+    # hc_post takes (x, residual, post, comb) — all runtime.
+    block.hc_post_attn = HCPostAttn(block, "hc_post")
+    block.hc_post_ffn = HCPostFfn(block, "hc_post")
+    block._hc_patched = True
+
+
+def _attach_hc_module_to_head(head: nn.Module) -> None:
+    """Attach 1 HC wrapper module to a ParallelHead."""
+    if getattr(head, "_hc_patched", False):
+        return
+    # hc_head takes (x, hc_fn, hc_scale, hc_base) — all runtime; the head
+    # is shared between Transformer and MTPBlocks, each supplying their own.
+    head.hc_head_module = HCHead(head, "hc_head")
+    head._hc_patched = True
+
+
+def patch_hc_for_capture(model: nn.Module) -> None:
+    """Inject HC wrapper nn.Modules so ModuleTracker sees HC boundaries.
+
+    Each Block / MTPBlock gets 4 child modules:
+      - ``hc_pre_attn`` / ``hc_post_attn`` (around the attn sub-layer)
+      - ``hc_pre_ffn``  / ``hc_post_ffn``  (around the ffn  sub-layer)
+
+    Each ParallelHead gets 1 child module ``hc_head_module``, used by both the
+    main Transformer's final head call and any MTPBlock's head call.
+
+    ``Block.forward`` and ``ParallelHead.forward`` are rebound on the *class*
+    so the change carries through the inheritance chain (MTPBlock inherits
+    Block.forward via ``super().forward`` in its own forward).
+    """
+    block_classes: set[type] = set()
+    head_classes: set[type] = set()
+
+    for _, module in model.named_modules():
+        cls = type(module)
+        cls_name = cls.__name__
+        if cls_name in ("Block", "MTPBlock") and hasattr(module, "hc_attn_fn"):
+            _attach_hc_modules_to_block(module)
+            # Only rebind the *defining* class for hc_pre/hc_post forward.
+            # MTPBlock keeps its own forward (which calls super().forward).
+            if cls_name == "Block":
+                block_classes.add(cls)
+        elif cls_name == "ParallelHead" and hasattr(module, "hc_head"):
+            _attach_hc_module_to_head(module)
+            head_classes.add(cls)
+
+    for cls in block_classes:
+        cls.forward = _block_forward_with_hc_modules
+    for cls in head_classes:
+        cls.forward = _head_forward_with_hc_module
+
+    if block_classes or head_classes:
+        logger.info(
+            "Applied HC capture patch — Block classes: %s; Head classes: %s",
+            ", ".join(c.__name__ for c in block_classes) or "(none)",
+            ", ".join(c.__name__ for c in head_classes) or "(none)",
+        )
+
+
 # Backward-compatible aliases
 patch_moe_for_meta = patch_moe_for_fake
 _is_moe_module = is_moe_module

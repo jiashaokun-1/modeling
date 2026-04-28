@@ -45,6 +45,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from python.zrt.graph.patches import (
     apply_compat_patches,
     is_moe_module as _is_moe_module,
+    patch_hc_for_capture,
     patch_indexer_for_fake,
     patch_moe_for_fake,
     patch_moe_for_meta,  # backward-compat alias
@@ -231,5 +232,6 @@ def load_model(
     model.eval()
     patch_moe_for_fake(model)
     patch_indexer_for_fake(model)
+    patch_hc_for_capture(model)
 
     return model, config, fake_mode

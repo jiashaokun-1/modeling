@@ -192,9 +192,38 @@ class TrainingMemoryPass(GraphPass):
         weights_bytes = (total_params * param_dtype) / weight_shard
         grads_bytes = (total_params * param_dtype) / grad_shard
 
-        optimizer = ctx.training.optimizer if ctx.training else "adam"
-        opt_bytes_per_param = 12 if optimizer in ("adam", "adamw") else 8
-        opt_bytes = (total_params * opt_bytes_per_param) / opt_shard
+        # ── Optimizer state memory ───────────────────────────────────────────────
+        # Try to use OptimizerPass annotation first (graph-based modeling)
+        opt_state_from_graph = None
+        for node in g.nodes.values():
+            if node.annotations.get("optimizer_step"):
+                opt_state_from_graph = node.attrs.get("state_bytes")
+                break
+
+        if opt_state_from_graph is not None:
+            # Use OptimizerPass annotation (already has TP/PP/DP sharding applied)
+            # Only need to apply ZeRO opt-state sharding
+            opt_bytes = opt_state_from_graph / opt_shard
+        else:
+            # Fallback: independent calculation (backward compatibility)
+            optimizer = ctx.training.optimizer if ctx.training else "adam"
+            master_bytes = 4  # FP32 master dtype
+
+            if optimizer in ("adam", "adamw"):
+                # Adam: master copy + m + v = 3 × P × master_dtype
+                opt_bytes_per_param = master_bytes * 3  # 12 B/P
+            elif optimizer == "muon":
+                # Muon: master copy + momentum ≈ 2.1 × P × master_dtype
+                opt_bytes_per_param = int(master_bytes * 2.1)
+            else:
+                opt_bytes_per_param = master_bytes * 3
+
+            # Apply PP sharding for fallback calculation
+            total_params_for_opt = total_params
+            if pp > 1:
+                total_params_for_opt = int(total_params / pp)
+
+            opt_bytes = (total_params_for_opt * opt_bytes_per_param) / opt_shard
 
         # ── Activation memory ─────────────────────────────────────────────────
         seq_len = g.metadata.get("seq_len", 2048)
@@ -230,12 +259,16 @@ class TrainingMemoryPass(GraphPass):
 
     def _korthikanti_activations(self, g, ctx, seq_len, hidden, num_layers,
                                   batch_size, tp, cp, pp):
-        """Korthikanti formula: 34 * h * s * L * bs with sharding and inflight."""
+        """Korthikanti formula: 34 * h * s * L * bs with sharding and inflight.
+
+        Improved to use actual recompute annotation fraction when available,
+        falling back to policy-based multipliers for "none"/"selective"/"full".
+        """
         base = 34 * hidden * seq_len * num_layers * batch_size
         shard = tp * max(cp, 1)
 
-        rc = getattr(ctx.training, "recompute_policy", "selective") if ctx.training else "selective"
-        rc_mult = {"none": 1.0, "selective": 0.5, "full": 0.1}.get(rc, 1.0)
+        # Try to derive recompute fraction from actual node annotations
+        rc_mult = self._derive_recompute_multiplier(g, ctx)
 
         # Stage-aware inflight (peak over local stages):
         # approximate activation volume per stage and scale by each stage's
@@ -256,6 +289,41 @@ class TrainingMemoryPass(GraphPass):
             max_inflight = pp
 
         return (base / shard) * rc_mult * max_inflight
+
+    def _derive_recompute_multiplier(self, g, ctx):
+        """Derive recompute memory multiplier from node annotations.
+
+        Priority order:
+        1. Count forward nodes with recompute=True annotation (graph-native)
+        2. Use training.recompute_policy string with fixed multipliers (fallback)
+
+        Returns:
+            Memory multiplier: 1.0 (no recompute) to ~0.1 (full recompute)
+        """
+        # Try graph-native: count actual recompute annotations
+        fwd_nodes = [
+            n for n in g.nodes.values()
+            if n.annotations.get("phase", "fwd") not in _BWD_PHASES
+        ]
+        if fwd_nodes:
+            recompute_count = sum(
+                1 for n in fwd_nodes if n.annotations.get("recompute")
+            )
+            if recompute_count > 0:
+                # Linear interpolation: more recompute = less memory
+                # Full selective recompute typically saves ~50%
+                fraction = recompute_count / len(fwd_nodes)
+                # Map fraction to memory saved: 0→1.0, 0.5→0.5, 1.0→0.1
+                if fraction >= 0.9:
+                    return 0.1  # Full recompute
+                elif fraction >= 0.3:
+                    return 1.0 - (fraction * 0.8)  # Selective scales to 0.1
+                else:
+                    return 1.0 - (fraction * 0.5)  # Light recompute
+
+        # Fallback: use policy string
+        rc = getattr(ctx.training, "recompute_policy", "none") if ctx.training else "none"
+        return {"none": 1.0, "selective": 0.5, "full": 0.1}.get(rc, 1.0)
 
     def _graph_native_activations(self, g, tp, cp):
         """Graph-native: sum saved activations from fwd→bwd edge liveness.
@@ -358,6 +426,10 @@ class TrainingPipelinePass(GraphPass):
             for node in g.nodes.values():
                 sid = node.annotations.get("stage_id", 0)
                 stage_node_sets.setdefault(sid, set()).add(node.id)
+
+            # Detect EP load imbalance before scheduling (affects all stages)
+            ep_imbalance = self._detect_ep_imbalance(g, ctx)
+
             for s_id in range(pp):
                 node_ids = stage_node_sets.get(s_id, set())
                 if not node_ids:
@@ -374,6 +446,12 @@ class TrainingPipelinePass(GraphPass):
                 if layer_scale != 1.0:
                     fwd *= layer_scale
                     bwd *= layer_scale
+
+                # Apply EP load imbalance factor to stage latency
+                if ep_imbalance > 1.0:
+                    fwd *= ep_imbalance
+                    bwd *= ep_imbalance
+
                 stage_fwd[s_id] = fwd
                 stage_bwd[s_id] = bwd
 
@@ -617,6 +695,37 @@ class TrainingPipelinePass(GraphPass):
             ring_factor * bucket_bytes / dp_bw_bytes_per_us
             if dp_bw_bytes_per_us > 0 else 0.0
         )
+
+    @staticmethod
+    def _detect_ep_imbalance(g: "OpGraph", ctx: "TransformContext") -> float:
+        """Detect Expert Parallel load imbalance factor.
+
+        EP imbalance occurs when experts receive uneven token loads, causing
+        some ranks to wait longer than others. The bottleneck stage time is
+        multiplied by this factor.
+
+        Returns:
+            Imbalance factor (1.0 = balanced, >1.0 = bottleneck). Defaults to 1.0
+            when EP is not used or imbalance cannot be detected.
+        """
+        ep = ctx.parallel.ep if ctx.parallel else 1
+        if ep <= 1:
+            return 1.0
+
+        # Count expert FFN nodes (nodes in MoE expert blocks)
+        expert_nodes = [
+            n for n in g.nodes.values()
+            if n.category == "compute" and ("expert" in n.scope.lower() or "moe" in n.scope.lower())
+        ]
+
+        if not expert_nodes:
+            return 1.0
+
+        # Simple heuristic: assume 10% imbalance for EP > 1
+        # In production, this would be derived from actual token routing statistics
+        # For now, use a conservative estimate based on EP degree
+        imbalance_factors = {2: 1.05, 4: 1.10, 8: 1.15, 16: 1.20}
+        return imbalance_factors.get(ep, 1.15)
 
 
 # ── Exposed comm-time helper ────────────────────────────────────────────────────

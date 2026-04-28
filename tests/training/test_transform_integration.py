@@ -287,15 +287,15 @@ def test_adam_opt_state_12_bytes_per_param():
     total_params = result.metadata.get("total_params", 0)
     if total_params == 0:
         total_params = 4096 * (4096 * 4)  # weight_0 shape
-    # opt_state should be 12 * total_params bytes (not 4 * total_params)
+    # opt_state should be 12 * total_params bytes for Adam (FP32: master + m + v = 3 × 4 bytes)
     expected_opt_bytes = total_params * 12
     assert breakdown.opt_state == pytest.approx(expected_opt_bytes, rel=0.01), (
-        f"Expected opt_state ≈ {expected_opt_bytes} (12 B/P), got {breakdown.opt_state}"
+        f"Expected opt_state ≈ {expected_opt_bytes} (12 B/P for FP32 Adam), got {breakdown.opt_state}"
     )
 
 
 def test_adamw_opt_state_same_as_adam():
-    """AdamW should use same 12 B/P as Adam."""
+    """AdamW should use same 12 B/P as Adam (FP32: master + m + v = 3 × 4 bytes)."""
     graph = _make_simple_graph()
     hw = _make_hardware_spec()
     ctx_adam = TransformContext(
